@@ -34,12 +34,8 @@ func NewOpenAIConnWrapper(ctx context.Context, conn *websocket.Conn, r *http.Req
 		idleTimeout: 0,
 		originReq:   r,
 	}
-	for _, op := range ops {
-		// Apply options if they match
-		if opt, ok := op.(func(*XiaozhiConnWrapper)); ok {
-			// Convert option for OpenAI wrapper if needed
-		}
-	}
+	// OpenAI wrapper doesn't support options, ignore them
+	_ = ops
 
 	// Connect to OpenAI Realtime API
 	if err := wsConn.ConnectToOpenAI(baseURL, apiKey, model); err != nil {

@@ -3,6 +3,7 @@ package xiaozhi
 import (
 	"os"
 
+	"github.com/google/uuid"
 	"github.com/kercre123/wire-pod/chipper/pkg/vars"
 )
 
@@ -75,4 +76,38 @@ func GetKnowledgeGraphConfig() (baseURL, voice string, voiceWithEnglish bool) {
 
 func GetOpenAIConfig() (baseURL, apiKey, model, voice string) {
 	return XiaozhiConfig.OpenAIBaseURL, XiaozhiConfig.OpenAIAPIKey, XiaozhiConfig.OpenAIModel, XiaozhiConfig.OpenAIVoice
+}
+
+// GetDeviceIDFromConfig lấy Device-Id (MAC address) từ config Knowledge Graph
+func GetDeviceIDFromConfig() string {
+	if vars.APIConfig.Knowledge.Provider == "xiaozhi" && vars.APIConfig.Knowledge.DeviceID != "" {
+		return vars.APIConfig.Knowledge.DeviceID
+	}
+	return ""
+}
+
+// GetClientIDFromConfig lấy Client-Id (UUID) từ config Knowledge Graph
+// Nếu chưa có, tự động generate UUID v4 và lưu vào config (giống ESP32)
+func GetClientIDFromConfig() string {
+	if vars.APIConfig.Knowledge.Provider == "xiaozhi" {
+		if vars.APIConfig.Knowledge.ClientID != "" {
+			return vars.APIConfig.Knowledge.ClientID
+		}
+		// Nếu chưa có Client-Id, tự động generate UUID v4 (giống ESP32)
+		newClientID := uuid.New().String()
+		vars.APIConfig.Knowledge.ClientID = newClientID
+		vars.WriteConfigToDisk()
+		return newClientID
+	}
+	return ""
+}
+
+// GenerateClientID tạo Client-Id mới (UUID v4) và lưu vào config
+func GenerateClientID() string {
+	newClientID := uuid.New().String()
+	if vars.APIConfig.Knowledge.Provider == "xiaozhi" {
+		vars.APIConfig.Knowledge.ClientID = newClientID
+		vars.WriteConfigToDisk()
+	}
+	return newClientID
 }
