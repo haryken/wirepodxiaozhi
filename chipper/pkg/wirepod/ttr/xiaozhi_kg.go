@@ -383,9 +383,9 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 
 		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ WebSocket reader goroutine started, waiting for messages...", esn))
 		audioBuffer := []byte{}
+		audioChunkCount := 0
 
 		for {
-			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⏳ Waiting for next message from server...", esn))
 			messageType, message, err := conn.ReadMessage()
 			if err != nil {
 				// Log chi tiết lỗi
@@ -626,38 +626,26 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 				// Binary audio data (Opus encoded from xiaozhi server)
 				// According to go-xiaozhi-main protocol, audio comes as Opus frames
 				// These are already Opus-encoded and ready to decode
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | 🔊 BINARY AUDIO MESSAGE RECEIVED", esn))
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Audio chunk size: %d bytes", esn, len(message)))
 
-				// Log first few bytes to identify format
-				if len(message) >= 4 {
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | First 4 bytes: %02x %02x %02x %02x", esn, message[0], message[1], message[2], message[3]))
-					// Check if it's OGG format (starts with "OggS")
-					if message[0] == 0x4f && message[1] == 0x67 && message[2] == 0x67 && message[3] == 0x53 {
-						logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Audio format: OGG container", esn))
-					} else {
-						logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Audio format: Raw OPUS frames (expected)", esn))
-					}
+				// Reduce logging frequency - only log first chunk and every 10th chunk
+				audioChunkCount++
+				if audioChunkCount == 1 {
+					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | 🔊 BINARY AUDIO MESSAGE RECEIVED (first chunk: %d bytes)", esn, len(message)))
 				}
-
-				// Log audio buffer status
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Audio buffer before append: %d bytes", esn, len(audioBuffer)))
 
 				// Send Opus frames directly to audio channel
 				// The audio player will decode them
-				// Note: In production, you'd decode Opus → PCM → Downsample 24k→16k → Send
-				// For now, we'll accumulate and send in chunks
 				audioBuffer = append(audioBuffer, message...)
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Audio buffer after append: %d bytes", esn, len(audioBuffer)))
 
 				// Process Opus frames (typically 20-60ms each, variable size)
 				// Send immediately when we have any audio data (don't wait for large buffer)
 				// This ensures real-time streaming without delay
 				if len(audioBuffer) > 0 {
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Audio buffer has %d bytes, sending to audio channel immediately", esn, len(audioBuffer)))
 					select {
 					case audioChunks <- audioBuffer:
-						logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Audio chunk sent to channel: %d bytes", esn, len(audioBuffer)))
+						if audioChunkCount%10 == 0 {
+							logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Audio chunk %d sent to channel: %d bytes", esn, audioChunkCount, len(audioBuffer)))
+						}
 						audioBuffer = []byte{}
 					default:
 						// Channel full, skip this chunk
@@ -734,14 +722,10 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 					return
 				}
 				if len(chunk) == 0 {
-					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  Empty audio chunk received, skipping", esn))
 					continue
 				}
 
-				logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | 📥 Received audio chunk: %d bytes", esn, len(chunk)))
-
 				if vclient == nil {
-					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  vclient is nil, skipping audio playback", esn))
 					continue
 				}
 
@@ -749,15 +733,12 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 				pcmBuffer := make([]int16, 1440) // 60ms @ 24kHz max
 				n, err := opusDecoder.Decode(chunk, pcmBuffer)
 				if err != nil {
-					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  OPUS decode error: %v, skipping chunk", esn, err))
+					// Skip corrupted frames silently
 					continue
 				}
 				if n == 0 {
-					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  OPUS decode returned 0 samples, skipping", esn))
 					continue
 				}
-
-				logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ OPUS decoded: %d samples (24kHz)", esn, n))
 
 				// Convert int16 → PCM bytes (little-endian)
 				framePCMBytes := make([]byte, n*2)
@@ -766,16 +747,11 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 					framePCMBytes[i*2+1] = byte(pcmBuffer[i] >> 8)
 				}
 
-				logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ Converted to PCM: %d bytes", esn, len(framePCMBytes)))
-
 				// Resample 24kHz → 8kHz (simple linear interpolation, like Play Audio)
 				downsampledChunks := resample24kTo8kSimple(framePCMBytes)
 				if len(downsampledChunks) == 0 {
-					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  Resample returned 0 chunks, skipping", esn))
 					continue
 				}
-
-				logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ Resampled to 8kHz: %d chunks", esn, len(downsampledChunks)))
 
 				// Send chunks immediately with 60ms delay (same as /api-sdk/play_sound)
 				chunkCount := 0
@@ -818,9 +794,6 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 
 					// Use 60ms delay (same as /api-sdk/play_sound which works well)
 					time.Sleep(time.Millisecond * 60)
-				}
-				if chunkCount > 0 {
-					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ Total chunks sent: %d", esn, chunkCount))
 				}
 			case err, ok := <-errChan:
 				if !ok {
