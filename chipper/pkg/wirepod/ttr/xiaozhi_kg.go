@@ -38,6 +38,9 @@ type LLMHandler struct {
 	ttsStopChan     chan bool
 	active          bool
 	audioChunkCount int
+	ttsStopped      bool      // Flag to indicate TTS has stopped (but don't close channel yet)
+	lastFrameTime   time.Time // Track when last audio frame was received (for timeout-based channel closing)
+	closeOnce       sync.Once // Ensure audioChunks is closed only once
 	mu              sync.RWMutex
 }
 
@@ -95,16 +98,64 @@ func (h *LLMHandler) HandleMessage(messageType int, message []byte) error {
 						}
 					}
 				} else if state == "stop" {
-					// TTS stopped - close audioChunks channel to signal audio processing goroutine
-					// Don't send any remaining buffer - all Opus frames should have been sent already
-					logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] 🔊 TTS stopped, closing audio channel"))
-					close(h.audioChunks)
+					// TTS stopped - mark as stopped but don't close channel yet
+					// Server may still send audio frames after TTS stop event (due to network delay/buffering)
+					// We'll close the channel after a timeout (no new frames for 500ms) to ensure all frames are received
+					h.mu.Lock()
+					h.ttsStopped = true
+					lastFrameTime := h.lastFrameTime // Use last frame time before TTS stop
+					if lastFrameTime.IsZero() {
+						lastFrameTime = time.Now() // If no frames received yet, use current time
+					}
+					h.mu.Unlock()
+					logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] 🔊 TTS stopped, will close audio channel after timeout (no new frames for 500ms) to receive remaining frames"))
 					// Signal TTS stop
 					select {
 					case h.ttsStopChan <- true:
 						logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ✅ TTS stop signal sent"))
 					default:
 					}
+					// Close channel after timeout (no new frames for 500ms) to allow remaining frames to be received
+					// This ensures all audio frames sent by server are processed
+					go func() {
+						ticker := time.NewTicker(100 * time.Millisecond) // Check every 100ms
+						defer ticker.Stop()
+						timeout := 500 * time.Millisecond // Close if no new frames for 500ms
+						for {
+							select {
+							case <-ticker.C:
+								h.mu.RLock()
+								ttsStopped := h.ttsStopped
+								currentLastFrame := h.lastFrameTime
+								h.mu.RUnlock()
+								// Use the later of: lastFrameTime (when TTS stopped) or currentLastFrame (if new frames arrived)
+								checkTime := lastFrameTime
+								if currentLastFrame.After(checkTime) {
+									checkTime = currentLastFrame
+								}
+								if ttsStopped && time.Since(checkTime) >= timeout {
+									// No new frames for 500ms, close channel
+									h.closeOnce.Do(func() {
+										logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] 🔒 Closing audio channel after timeout (no new frames for 500ms)"))
+										close(h.audioChunks)
+									})
+									return
+								}
+							case <-time.After(2 * time.Second):
+								// Safety timeout - close after 2 seconds max
+								h.mu.RLock()
+								ttsStopped := h.ttsStopped
+								h.mu.RUnlock()
+								if ttsStopped {
+									h.closeOnce.Do(func() {
+										logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] 🔒 Closing audio channel after safety timeout (2s)"))
+										close(h.audioChunks)
+									})
+									return
+								}
+							}
+						}
+					}()
 				}
 			}
 		case "error":
@@ -142,6 +193,10 @@ func (h *LLMHandler) HandleMessage(messageType int, message []byte) error {
 			}()
 			select {
 			case audioChunks <- message:
+				// Update last frame time when successfully sent
+				h.mu.Lock()
+				h.lastFrameTime = time.Now()
+				h.mu.Unlock()
 				if count == 1 || count%10 == 0 {
 					logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ✅ Opus frame sent (frame #%d, %d bytes)", count, len(message)))
 				}
@@ -470,7 +525,8 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 	audioChunks := make(chan []byte, 500) // Increased buffer to prevent dropping chunks
 	textResponse := make(chan string, 5)  // Increased buffer to handle both LLM and TTS sentence_start events
 	errChan := make(chan error, 1)
-	ttsStopChan := make(chan bool, 1) // Signal when TTS stops (for connection release timing)
+	ttsStopChan := make(chan bool, 1)         // Signal when TTS stops (for connection release timing)
+	audioProcessingDone := make(chan bool, 1) // Signal when audio processing goroutine completes
 
 	// Create LLM handler instance
 	llmHandler := &LLMHandler{
@@ -626,6 +682,11 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 						logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ Audio stream complete sent to robot", esn))
 					}
 				}
+				// Signal that audio processing is done
+				select {
+				case audioProcessingDone <- true:
+				default:
+				}
 				return
 			case chunk, ok := <-audioChunks:
 				if !ok {
@@ -662,6 +723,11 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 						}
 					}
 					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | Audio channel closed, exiting", esn))
+					// Signal that audio processing is done
+					select {
+					case audioProcessingDone <- true:
+					default:
+					}
 					return
 				}
 				if len(chunk) == 0 {
@@ -808,10 +874,20 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 				}
 			case err, ok := <-errChan:
 				if !ok {
+					// Signal that audio processing is done
+					select {
+					case audioProcessingDone <- true:
+					default:
+					}
 					return
 				}
 				if err != nil {
 					logger.Println("Xiaozhi KG error: " + err.Error())
+				}
+				// Signal that audio processing is done (error path)
+				select {
+				case audioProcessingDone <- true:
+				default:
 				}
 				return
 			}
@@ -854,15 +930,25 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ==============================================", esn))
 		}()
 
-		// Wait for TTS to complete before releasing connection
+		// Wait for audio processing to complete before releasing connection
 		// Keep WebSocket reader goroutine running continuously (like xiaozhi-esp32-main)
 		// It will ignore messages when no LLM request is active
+		// IMPORTANT: Wait for audio channel to close (audio processing done) instead of TTS stop event
+		// This ensures all audio frames are processed even if TTS stop event is not received
 		if connFromSTT {
-			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⏳ Waiting for TTS stop event before releasing connection (keeping reader goroutine running)...", esn))
-			// Wait for TTS stop event with timeout
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⏳ Waiting for audio processing to complete before releasing connection (keeping reader goroutine running)...", esn))
+			// Wait for either TTS stop event OR audio processing done (whichever comes first)
+			// Use longer timeout (120s) for long responses
 			select {
 			case <-ttsStopChan:
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ TTS stop event received", esn))
+				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ TTS stop event received, waiting for audio processing to complete...", esn))
+				// Wait for audio processing to complete (audio channel closed)
+				select {
+				case <-audioProcessingDone:
+					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Audio processing completed", esn))
+				case <-time.After(10 * time.Second):
+					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Timeout waiting for audio processing (10s), proceeding anyway", esn))
+				}
 				// Wait a bit for WebSocket reader goroutine to process remaining messages
 				time.Sleep(1 * time.Second)
 				// Deactivate LLM handler - connection manager's reader will route messages to STT handler
@@ -876,8 +962,22 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 					xiaozhi.ReleaseConnection(deviceID)
 					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Connection released (STT handler will handle next request)", esn))
 				}
-			case <-time.After(30 * time.Second):
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Timeout waiting for TTS stop event (30s), releasing connection anyway", esn))
+			case <-audioProcessingDone:
+				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Audio processing completed (audio channel closed)", esn))
+				// Wait a bit for WebSocket reader goroutine to process remaining messages
+				time.Sleep(1 * time.Second)
+				// Deactivate LLM handler - connection manager's reader will route messages to STT handler
+				if deviceID != "" && connFromSTT {
+					llmHandler.SetActive(false)
+					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ LLM handler deactivated (connection manager will route to STT handler)", esn))
+				}
+				// Release connection (don't close it) so STT can reuse for next request
+				if deviceID != "" {
+					xiaozhi.ReleaseConnection(deviceID)
+					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Connection released (STT handler will handle next request)", esn))
+				}
+			case <-time.After(120 * time.Second):
+				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Timeout waiting for audio processing (120s), releasing connection anyway", esn))
 				// Deactivate LLM handler - connection manager's reader will route messages to STT handler
 				if deviceID != "" && connFromSTT {
 					llmHandler.SetActive(false)
@@ -890,8 +990,13 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 				}
 			}
 		} else {
-			// For new connections, just wait a bit for audio to finish
-			time.Sleep(2 * time.Second)
+			// For new connections, wait for audio processing to complete
+			select {
+			case <-audioProcessingDone:
+				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Audio processing completed", esn))
+			case <-time.After(10 * time.Second):
+				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Timeout waiting for audio processing (10s), proceeding anyway", esn))
+			}
 		}
 
 		// Check if conversation should continue (newVoiceRequest action)
