@@ -35,7 +35,7 @@ require (
 	golang.org/x/sync v0.13.0
 	golang.org/x/text v0.14.0
 	google.golang.org/grpc v1.60.0
-	gopkg.in/hraban/opus.v2 v2.0.0-20201025103112-d779bb1cc5a2
+	gopkg.in/hraban/opus.v2 v2.0.0-20230925203106-0188a62cb302
 	gopkg.in/ini.v1 v1.67.0
 )
 

@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -16,7 +16,7 @@ import (
 	"github.com/kercre123/wire-pod/chipper/pkg/logger"
 	"github.com/kercre123/wire-pod/chipper/pkg/vars"
 	"github.com/kercre123/wire-pod/chipper/pkg/xiaozhi"
-	opuslib "gopkg.in/hraban/opus.v2"
+	"gopkg.in/hraban/opus.v2"
 )
 
 // AudioQueue manages audio playback serialization per robot
@@ -28,6 +28,148 @@ type AudioQueue struct {
 
 var AudioQueues []AudioQueue
 var audioQueueMutex sync.Mutex
+
+// LLMHandler implements MessageHandler interface for LLM
+// This handler processes LLM/TTS-related messages from the single reader goroutine
+type LLMHandler struct {
+	audioChunks     chan []byte
+	textResponse    chan string
+	errChan         chan error
+	ttsStopChan     chan bool
+	active          bool
+	audioChunkCount int
+	mu              sync.RWMutex
+}
+
+// HandleMessage processes messages from the WebSocket connection
+func (h *LLMHandler) HandleMessage(messageType int, message []byte) error {
+	h.mu.RLock()
+	active := h.active
+	h.mu.RUnlock()
+
+	if !active {
+		return nil // Handler is not active, ignore message
+	}
+
+	if messageType == websocket.TextMessage {
+		var event map[string]interface{}
+		if err := json.Unmarshal(message, &event); err != nil {
+			logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ERROR - Failed to unmarshal message: %v", err))
+			return err
+		}
+
+		eventType, ok := event["type"].(string)
+		if !ok {
+			return nil
+		}
+
+		switch eventType {
+		case "llm":
+			if text, ok := event["text"].(string); ok && text != "" {
+				logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ✅ LLM text: '%s'", text))
+				select {
+				case h.textResponse <- text:
+					logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ✅ LLM text sent to channel: '%s'", text))
+				default:
+					logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ⚠️  textResponse channel is full, dropping text"))
+				}
+			}
+		case "tts":
+			if state, ok := event["state"].(string); ok {
+				logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] 🔊 TTS state: %s", state))
+				if state == "start" {
+					// Reset counter when TTS starts
+					h.mu.Lock()
+					h.audioChunkCount = 0
+					h.mu.Unlock()
+					logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ✅ TTS started, ready to receive Opus frames"))
+				} else if state == "sentence_start" {
+					// TTS sentence_start contains the full text response (priority over LLM event)
+					if text, ok := event["text"].(string); ok && text != "" {
+						logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ✅ TTS sentence_start text: '%s'", text))
+						select {
+						case h.textResponse <- text:
+							logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ✅ TTS sentence_start text sent to channel: '%s'", text))
+						default:
+							logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ⚠️  textResponse channel is full, dropping text"))
+						}
+					}
+				} else if state == "stop" {
+					// TTS stopped - close audioChunks channel to signal audio processing goroutine
+					// Don't send any remaining buffer - all Opus frames should have been sent already
+					logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] 🔊 TTS stopped, closing audio channel"))
+					close(h.audioChunks)
+					// Signal TTS stop
+					select {
+					case h.ttsStopChan <- true:
+						logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ✅ TTS stop signal sent"))
+					default:
+					}
+				}
+			}
+		case "error":
+			errorMsg := "unknown error"
+			if msg, ok := event["error"].(string); ok {
+				errorMsg = msg
+			} else if msg, ok := event["message"].(string); ok {
+				errorMsg = msg
+			}
+			select {
+			case h.errChan <- fmt.Errorf("xiaozhi error: %s", errorMsg):
+			default:
+			}
+		}
+	} else if messageType == websocket.BinaryMessage {
+		// Audio data (Opus-encoded from server)
+		// Server sends Opus frames directly, we should forward them immediately
+		// Don't buffer - send Opus frames as they arrive for real-time playback
+		h.mu.Lock()
+		h.audioChunkCount++
+		count := h.audioChunkCount
+		audioChunks := h.audioChunks // Capture channel reference
+		h.mu.Unlock()
+
+		// Send Opus frame immediately (don't wait for large buffer)
+		// Audio processing goroutine will decode Opus → PCM → Downsample → Send to robot
+		// Use recover to handle panic if channel is closed
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Channel is closed - this can happen if TTS stopped but ConnectionManager
+					// still receives messages from the server
+					logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ⚠️  audioChunks channel is closed, dropping Opus frame (recovered from panic: %v)", r))
+				}
+			}()
+			select {
+			case audioChunks <- message:
+				if count == 1 || count%10 == 0 {
+					logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ✅ Opus frame sent (frame #%d, %d bytes)", count, len(message)))
+				}
+			default:
+				logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ⚠️  audioChunks channel is full, dropping Opus frame"))
+			}
+		}()
+	}
+	return nil
+}
+
+// IsActive returns whether the handler is currently active
+func (h *LLMHandler) IsActive() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.active
+}
+
+// SetActive sets the handler as active or inactive
+func (h *LLMHandler) SetActive(active bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.active = active
+	if !active {
+		// Reset counter when deactivating
+		h.audioChunkCount = 0
+	}
+}
 
 // WaitForAudio_Queue waits for current audio playback to complete before starting new one
 func WaitForAudio_Queue(esn string) {
@@ -103,7 +245,22 @@ func StopAudio_Queue(esn string) {
 // This provides real-time voice conversation with TTS audio playback on robot
 // isConversationMode: if true, LLM will use {{newVoiceRequest||now}} to continue conversation
 func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConversationMode bool) (string, error) {
-	ctx := context.Background()
+	// Create context for audio playback - don't cancel until audio is done
+	// NOTE: audioCancel will be called by audio processing goroutine when it completes
+	// We also cancel in error paths (timeout, error) as a safety net
+	// Using sync.Once ensures it's only canceled once
+	audioCtx, audioCancel := context.WithCancel(context.Background())
+	var audioCancelOnce sync.Once
+	audioCancelSafe := func() {
+		audioCancelOnce.Do(audioCancel)
+	}
+	// NOTE: Do NOT cancel in defer here - let audio processing goroutine cancel it when done
+	// This prevents vclient stream from closing while audio is still being sent
+	// Only cancel in error paths (timeout, error) explicitly
+
+	// Create separate context for LLM request (can be canceled when LLM response is received)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // Ensure context is canceled when function returns
 
 	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ========== STARTING StreamingXiaozhiKG ==========", esn))
 	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ESN: %s, TranscribedText: '%s', isKG: %v, isConversationMode: %v", esn, esn, transcribedText, isKG, isConversationMode))
@@ -135,68 +292,34 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Robot %s not found in vars.BotInfo.Robots", esn, esn))
 	}
 
-	// Step 2: If not found, try to find IP from RecurringInfo
-	if !matched {
-		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Robot not found in vars.BotInfo.Robots, checking RecurringInfo (count: %d)...", esn, len(vars.RecurringInfo)))
-		for i, rinfo := range vars.RecurringInfo {
-			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s |   RecurringInfo[%d]: ESN=%s, IP=%s, ID=%s", esn, i, rinfo.ESN, rinfo.IP, rinfo.ID))
-			if rinfo.ESN == esn && rinfo.IP != "" {
-				guid = vars.BotInfo.GlobalGUID // Use GlobalGUID if robot not in BotInfo
-				target = rinfo.IP + ":443"
-				matched = true
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Found robot in RecurringInfo (IP: %s, using GlobalGUID: %s)", esn, rinfo.IP, guid))
-				break
-			}
-		}
-		if !matched {
-			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Robot %s not found in RecurringInfo either", esn, esn))
-		}
+	var err error
+	robot, err = vector.New(vector.WithSerialNo(esn), vector.WithToken(guid), vector.WithTarget(target))
+	if err != nil {
+		return "", err
 	}
 
-	// Step 3: Try to create robot connection if we have IP and GUID
-	if matched && target != "" && guid != "" {
-		var err error
-		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Attempting to create robot connection (ESN: %s, GUID: %s, Target: %s)", esn, esn, guid, target))
-		robot, err = vector.New(vector.WithSerialNo(esn), vector.WithToken(guid), vector.WithTarget(target))
-		if err != nil {
-			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Failed to create robot connection: %v. Continuing without robot connection.", esn, err))
-			robot = nil // Ensure robot is nil on error
-		} else {
-			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Robot connection created successfully", esn))
-			// Test connection with battery state (non-blocking - don't fail if this errors)
-			_, err = robot.Conn.BatteryState(ctx, &vectorpb.BatteryStateRequest{})
-			if err != nil {
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Failed to get battery state: %v. Robot connection may still work for audio playback.", esn, err))
-				// Don't set robot to nil here - connection might still work for audio
-			} else {
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Robot connection verified (battery state OK)", esn))
-			}
-		}
-	} else {
-		if !matched {
-			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Robot %s not found in vars.BotInfo.Robots or RecurringInfo. Available robots: %d", esn, esn, len(vars.BotInfo.Robots)))
-			for i, bot := range vars.BotInfo.Robots {
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s |   Robot[%d]: ESN=%s, IP=%s", esn, i, bot.Esn, bot.IPAddress))
-			}
-		} else {
-			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Missing IP or GUID for robot %s (target: %s, guid: %s)", esn, esn, target, guid))
-		}
-		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Continuing with xiaozhi TTS/STT without robot connection (audio playback will be skipped)", esn))
+	_, err = robot.Conn.BatteryState(ctx, &vectorpb.BatteryStateRequest{})
+	if err != nil {
+		return "", err
 	}
 
 	// Lấy Device-Id từ config
 	deviceID := xiaozhi.GetDeviceIDFromConfig()
 
 	// Bước 1: Thử lấy connection từ STT (giống botkct.py - dùng cùng connection cho STT và text message)
+	// Dùng CheckConnection để kiểm tra mà không mark "in use" (giống STT)
 	var conn *websocket.Conn
 	var sessionID string
 	var connFromSTT bool
 
 	if deviceID != "" {
-		if storedConn, storedSessionID, exists := xiaozhi.GetConnection(deviceID); exists {
+		if storedConn, storedSessionID, exists := xiaozhi.CheckConnection(deviceID); exists {
+			// Connection exists and can be reused - now mark it as "in use" for LLM
 			conn = storedConn
 			sessionID = storedSessionID
 			connFromSTT = true
+			// Mark connection as "in use" for LLM
+			xiaozhi.GetConnection(deviceID) // This marks it as "in use"
 			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ REUSING connection from STT (sessionID: %s) - giống botkct.py", esn, sessionID))
 		}
 	}
@@ -281,25 +404,22 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 			sessionID = sid
 			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Using session_id from hello: %s", esn, sessionID))
 		}
+
+		// Store new connection in manager and start reader (like STT does)
+		if deviceID != "" {
+			xiaozhi.StoreConnection(deviceID, conn, sessionID)
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Stored NEW connection for device %s (sessionID: %s) - reader goroutine started", esn, deviceID, sessionID))
+			// Mark connection as "in use" for LLM
+			xiaozhi.GetConnection(deviceID) // This marks it as "in use"
+		}
 	}
 
-	// Cleanup: Đóng connection sau khi xong (chỉ nếu không phải connection từ STT, hoặc đóng sau khi LLM xong)
+	// Cleanup: Giữ connection trong manager để reuse cho request tiếp theo (giống botkct.py)
+	// Chỉ đóng connection nếu có lỗi hoặc connection không còn valid
 	defer func() {
-		if !connFromSTT {
-			// Nếu là connection mới, đóng ngay
-			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | 🔌 Closing WebSocket connection (new connection)...", esn))
-			if err := conn.Close(); err != nil {
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Error closing WebSocket: %v", esn, err))
-			} else {
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ WebSocket closed successfully", esn))
-			}
-		} else {
-			// Nếu là connection từ STT, xóa khỏi manager sau khi LLM xong
-			if deviceID != "" {
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | 🔌 Removing connection from manager (LLM finished)", esn))
-				xiaozhi.RemoveConnection(deviceID)
-			}
-		}
+		// Connection is now always in manager (either from STT or newly created)
+		// Don't close it here - let it be reused for next request
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Connection kept in manager for reuse (connFromSTT: %v)", esn, connFromSTT))
 	}()
 
 	// Step 2: Send text query (giống botkct.py line 789 - gửi trực tiếp sau khi nhận STT, KHÔNG gửi listen start)
@@ -318,19 +438,55 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 	}
 	// KHÔNG thêm device_id hay client_id vào message body (theo botkct.py)
 
+	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ========== SENDING TEXT QUERY ==========", esn))
 	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Sending text query: %s", esn, transcribedText))
 	textMessageJSON, _ := json.Marshal(textMessage)
 	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Text message JSON: %s", esn, string(textMessageJSON)))
+	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Connection status: conn == nil? %v, connFromSTT? %v, sessionID: %s", esn, conn == nil, connFromSTT, sessionID))
 
-	if err := conn.WriteJSON(textMessage); err != nil {
-		return "", fmt.Errorf("failed to send text query: %w", err)
+	// Use WriteJSON helper if connection is in manager (to serialize writes)
+	if deviceID != "" {
+		if err := xiaozhi.WriteJSON(deviceID, textMessage); err != nil {
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ❌ ERROR - Failed to send text query: %v", esn, err))
+			return "", fmt.Errorf("failed to send text query: %w", err)
+		}
+	} else {
+		if err := conn.WriteJSON(textMessage); err != nil {
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ❌ ERROR - Failed to send text query: %v", esn, err))
+			return "", fmt.Errorf("failed to send text query: %w", err)
+		}
 	}
-	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Text query sent successfully", esn))
+	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Text query sent successfully to server", esn))
+	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ========================================", esn))
+
+	// Step 3: Note - xiaozhi expects audio input, not text
+	// Since we already have transcribed text from STT, we need to:
+	// Option 1: Use TTS to convert text back to audio (not ideal)
+	// Option 2: Use xiaozhi's text query feature if available
+	// Option 3: For now, we'll just wait for any audio response from xiaozhi
+	// In a real implementation, you'd send the audio that was transcribed
 
 	done := make(chan bool)
-	audioChunks := make(chan []byte, 100)
-	textResponse := make(chan string, 1)
+	audioChunks := make(chan []byte, 500) // Increased buffer to prevent dropping chunks
+	textResponse := make(chan string, 5)  // Increased buffer to handle both LLM and TTS sentence_start events
 	errChan := make(chan error, 1)
+	ttsStopChan := make(chan bool, 1) // Signal when TTS stops (for connection release timing)
+
+	// Create LLM handler instance
+	llmHandler := &LLMHandler{
+		audioChunks:     audioChunks,
+		textResponse:    textResponse,
+		errChan:         errChan,
+		ttsStopChan:     ttsStopChan,
+		active:          true,
+		audioChunkCount: 0,
+	}
+
+	// Register LLM handler with connection manager (always register, whether connection from STT or newly created)
+	if deviceID != "" {
+		xiaozhi.SetLLMHandler(deviceID, llmHandler)
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | LLM handler registered for device %s (connFromSTT: %v)", esn, deviceID, connFromSTT))
+	}
 
 	// Setup audio playback client (only if robot connection exists)
 	// Use the same pattern as kgsim_cmds.go - let Go infer the type
@@ -340,7 +496,8 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Checking robot connection status: robot == nil? %v", esn, robot == nil))
 	if robot != nil {
 		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Creating audio playback client for robot...", esn))
-		audioClient, err := robot.Conn.ExternalAudioStreamPlayback(ctx)
+		// Use audioCtx instead of ctx to prevent stream from closing when LLM request completes
+		audioClient, err := robot.Conn.ExternalAudioStreamPlayback(audioCtx)
 		if err != nil {
 			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Failed to create audio playback client: %v. Continuing without audio playback.", esn, err))
 			vclient = nil
@@ -360,7 +517,7 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Failed to send AudioStreamPrepare: %v. Disabling audio playback.", esn, err))
 				vclient = nil // Disable audio playback if prepare fails
 			} else {
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ AudioStreamPrepare sent successfully (16kHz, volume 100)", esn))
+				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ AudioStreamPrepare sent successfully (8kHz, volume 100)", esn))
 			}
 		}
 	} else {
@@ -372,300 +529,29 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 		vclient = nil
 	}
 
-	// Read messages from WebSocket
-	go func() {
-		defer func() {
-			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | WebSocket reader goroutine exiting, closing channels", esn))
-			close(audioChunks)
-			close(textResponse)
-			close(errChan)
-		}()
-
-		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ WebSocket reader goroutine started, waiting for messages...", esn))
-		audioBuffer := []byte{}
-		audioChunkCount := 0
-
-		for {
-			messageType, message, err := conn.ReadMessage()
-			if err != nil {
-				// Log chi tiết lỗi
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ❌ WebSocket ReadMessage ERROR", esn))
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Error: %v", esn, err))
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Error type: %T", esn, err))
-
-				// Kiểm tra loại lỗi chi tiết
-				if opErr, ok := err.(*net.OpError); ok {
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | OpError details:", esn))
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s |   Op: %s", esn, opErr.Op))
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s |   Net: %s", esn, opErr.Net))
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s |   Addr: %v", esn, opErr.Addr))
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s |   Err: %v", esn, opErr.Err))
-					if opErr.Err != nil {
-						logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s |   Err type: %T", esn, opErr.Err))
-					}
-				}
-
-				// Kiểm tra close error
-				if closeErr, ok := err.(*websocket.CloseError); ok {
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | CloseError details:", esn))
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s |   Code: %d", esn, closeErr.Code))
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s |   Text: %s", esn, closeErr.Text))
-				}
-
-				// Kiểm tra nếu là unexpected close
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ❌ UNEXPECTED WebSocket close error", esn))
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | This indicates the server closed the connection unexpectedly", esn))
-					errChan <- fmt.Errorf("websocket unexpected close: %w", err)
-				} else {
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ WebSocket closed normally or expected error", esn))
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | This is normal when connection is closed intentionally", esn))
-				}
-				return
-			}
-			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Received message from server: type=%d, size=%d bytes", esn, messageType, len(message)))
-
-			if messageType == websocket.TextMessage {
-				var event map[string]interface{}
-				if err := json.Unmarshal(message, &event); err != nil {
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ERROR - Failed to unmarshal message: %v", esn, err))
-					continue
-				}
-
-				eventType, ok := event["type"].(string)
-				if !ok {
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | WARNING - Message missing 'type' field", esn))
-					continue
-				}
-
-				// Log all events for debugging
-				eventJSON, _ := json.MarshalIndent(event, "", "  ")
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ========== EVENT RECEIVED ==========", esn))
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Event type: %s", esn, eventType))
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Event JSON:\n%s", esn, string(eventJSON)))
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ====================================", esn))
-
-				switch eventType {
-				case "stt":
-					// STT transcription received
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | 🎤 STT EVENT received", esn))
-					if text, ok := event["text"].(string); ok {
-						logger.Println(fmt.Sprintf("[Xiaozhi STT] Device: %s | ✅ Transcribed text: %s", esn, text))
-						// Log additional STT info if available
-						if confidence, ok := event["confidence"].(float64); ok {
-							logger.Println(fmt.Sprintf("[Xiaozhi STT] Device: %s | Confidence: %.2f", esn, confidence))
-						}
-						if duration, ok := event["duration"].(float64); ok {
-							logger.Println(fmt.Sprintf("[Xiaozhi STT] Device: %s | Duration: %.2fs", esn, duration))
-						}
-						// Log all STT event fields
-						for key, value := range event {
-							if key != "type" && key != "text" && key != "confidence" && key != "duration" {
-								logger.Println(fmt.Sprintf("[Xiaozhi STT] Device: %s | STT field %s: %v (type: %T)", esn, key, value, value))
-							}
-						}
-					} else {
-						logger.Println(fmt.Sprintf("[Xiaozhi STT] Device: %s | ⚠️  WARNING - STT event missing 'text' field", esn))
-					}
-				case "llm":
-					// LLM response text
-					logger.Println(fmt.Sprintf("[Xiaozhi LLM] Device: %s | ========== LLM EVENT RECEIVED ==========", esn))
-					logger.Println(fmt.Sprintf("[Xiaozhi LLM] Device: %s | Full LLM event: %+v", esn, event))
-					if text, ok := event["text"].(string); ok {
-						logger.Println(fmt.Sprintf("[Xiaozhi LLM] Device: %s | ✅ LLM Response TEXT: '%s' (length: %d bytes)", esn, text, len(text)))
-						// Log all LLM event fields
-						for key, value := range event {
-							if key != "type" && key != "text" {
-								logger.Println(fmt.Sprintf("[Xiaozhi LLM] Device: %s | LLM field %s: %v (type: %T)", esn, key, value, value))
-							}
-						}
-						// Store full LLM response text (may be sent in chunks)
-						// We'll check for newVoiceRequest at the end when we have full response
-						select {
-						case textResponse <- text:
-							logger.Println(fmt.Sprintf("[Xiaozhi LLM] Device: %s | ✅ LLM text sent to response channel: '%s'", esn, text))
-						default:
-							logger.Println(fmt.Sprintf("[Xiaozhi LLM] Device: %s | ⚠️  WARNING - textResponse channel full, dropping LLM text: '%s'", esn, text))
-						}
-						logger.Println(fmt.Sprintf("[Xiaozhi LLM] Device: %s | ========================================", esn))
-					} else {
-						logger.Println(fmt.Sprintf("[Xiaozhi LLM] Device: %s | ⚠️  WARNING - LLM event missing 'text' field", esn))
-						keys := make([]string, 0, len(event))
-						for k := range event {
-							keys = append(keys, k)
-						}
-						logger.Println(fmt.Sprintf("[Xiaozhi LLM] Device: %s | LLM event keys: %v", esn, keys))
-					}
-				case "tts":
-					// TTS state change
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | 🎤 TTS EVENT received", esn))
-					if state, ok := event["state"].(string); ok {
-						if state == "start" {
-							audioBuffer = []byte{}
-							logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ TTS STARTED - Ready to receive audio", esn))
-							// Log TTS text if available
-							if text, ok := event["text"].(string); ok {
-								logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | Text to speak: %s", esn, text))
-							}
-							// Log all TTS event fields
-							for key, value := range event {
-								if key != "type" && key != "state" && key != "text" {
-									logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | TTS field %s: %v (type: %T)", esn, key, value, value))
-								}
-							}
-						} else if state == "sentence_start" {
-							// TTS sentence_start contains the full text response (giống botkct.py line 858-876)
-							logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ========== TTS SENTENCE_START EVENT ==========", esn))
-							if text, ok := event["text"].(string); ok && text != "" {
-								logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ TTS sentence_start TEXT: '%s' (length: %d bytes)", esn, text, len(text)))
-								// Send text to response channel (this is the actual LLM response text)
-								// Priority: TTS sentence_start text > LLM event text (vì TTS có text đầy đủ)
-								select {
-								case textResponse <- text:
-									logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ TTS sentence_start text sent to response channel: '%s'", esn, text))
-								default:
-									logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  WARNING - textResponse channel full, dropping TTS sentence_start text: '%s'", esn, text))
-								}
-								logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ==========================================", esn))
-							} else {
-								logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  WARNING - TTS sentence_start event missing 'text' field", esn))
-							}
-							// Log all TTS sentence_start event fields
-							for key, value := range event {
-								if key != "type" && key != "state" && key != "text" {
-									logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | TTS sentence_start field %s: %v (type: %T)", esn, key, value, value))
-								}
-							}
-						} else if state == "stop" {
-							logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ TTS STOPPED | Audio buffer size: %d bytes", esn, len(audioBuffer)))
-							// Log all TTS stop event fields
-							for key, value := range event {
-								if key != "type" && key != "state" {
-									logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | TTS stop field %s: %v (type: %T)", esn, key, value, value))
-								}
-							}
-							// Send remaining audio
-							if len(audioBuffer) > 0 {
-								logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | Sending final audio buffer: %d bytes", esn, len(audioBuffer)))
-								select {
-								case audioChunks <- audioBuffer:
-									logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ Final audio chunk sent to channel: %d bytes", esn, len(audioBuffer)))
-								default:
-									logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  WARNING - Audio channel full, dropping final chunk", esn))
-								}
-							} else {
-								logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  WARNING - TTS stopped but audio buffer is empty", esn))
-							}
-							done <- true
-							logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ TTS complete, signaling done", esn))
-							return
-						} else {
-							logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | Unknown TTS state: %s", esn, state))
-						}
-					} else {
-						logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  WARNING - TTS event missing 'state' field", esn))
-					}
-				case "error":
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ❌ ERROR EVENT received from server", esn))
-					if errMsg, ok := event["error"].(string); ok {
-						logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ❌ Error message: %s", esn, errMsg))
-						// Log all error event fields
-						for key, value := range event {
-							if key != "type" && key != "error" {
-								logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Error field %s: %v (type: %T)", esn, key, value, value))
-							}
-						}
-						errChan <- fmt.Errorf("xiaozhi error: %s", errMsg)
-						return
-					} else {
-						logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Error event missing 'error' field", esn))
-					}
-				case "alert":
-					// Alert from server (may contain error messages)
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  ALERT EVENT received from server", esn))
-					// Log all alert event fields
-					for key, value := range event {
-						logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Alert field %s: %v (type: %T)", esn, key, value, value))
-					}
-					// Check if alert contains error message
-					if message, ok := event["message"].(string); ok {
-						logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Alert message: %s", esn, message))
-						// If alert has status ERROR, treat it as an error
-						if status, ok := event["status"].(string); ok && status == "ERROR" {
-							logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ❌ Alert contains ERROR status, treating as error", esn))
-							errChan <- fmt.Errorf("xiaozhi alert error: %s", message)
-							return
-						}
-					}
-				case "mcp":
-					// MCP (Model Context Protocol) event - used for IoT/control commands
-					// botkct.py (line 960-967) xử lý MCP event nhưng chỉ log, không làm gì đặc biệt
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | 🔧 MCP EVENT received", esn))
-					if payload, ok := event["payload"].(map[string]interface{}); ok {
-						if result, ok := payload["result"].(map[string]interface{}); ok {
-							logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | 🔧 MCP Result: %+v", esn, result))
-						} else if err, ok := payload["error"].(map[string]interface{}); ok {
-							logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | 🔧 MCP Error: %+v", esn, err))
-						} else if method, ok := payload["method"].(string); ok {
-							logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | 🔧 MCP Method: %s (initialize - this is normal)", esn, method))
-							// MCP initialize is normal - server is setting up MCP protocol
-							// Continue waiting for LLM/TTS events
-						}
-					}
-					// Log full MCP event for debugging
-					mcpJSON, _ := json.MarshalIndent(event, "", "  ")
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | MCP Event JSON:\n%s", esn, string(mcpJSON)))
-					// Continue waiting for LLM/TTS events (MCP is just a protocol setup)
-				default:
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Unknown event type: %s", esn, eventType))
-					// Log full event for debugging
-					unknownJSON, _ := json.MarshalIndent(event, "", "  ")
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Unknown Event JSON:\n%s", esn, string(unknownJSON)))
-				}
-			} else if messageType == websocket.BinaryMessage {
-				// Binary audio data (Opus encoded from xiaozhi server)
-				// According to go-xiaozhi-main protocol, audio comes as Opus frames
-				// These are already Opus-encoded and ready to decode
-
-				// Reduce logging frequency - only log first chunk and every 10th chunk
-				audioChunkCount++
-				if audioChunkCount == 1 {
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | 🔊 BINARY AUDIO MESSAGE RECEIVED (first chunk: %d bytes)", esn, len(message)))
-				}
-
-				// Send Opus frames directly to audio channel
-				// The audio player will decode them
-				audioBuffer = append(audioBuffer, message...)
-
-				// Process Opus frames (typically 20-60ms each, variable size)
-				// Send immediately when we have any audio data (don't wait for large buffer)
-				// This ensures real-time streaming without delay
-				if len(audioBuffer) > 0 {
-					select {
-					case audioChunks <- audioBuffer:
-						if audioChunkCount%10 == 0 {
-							logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Audio chunk %d sent to channel: %d bytes", esn, audioChunkCount, len(audioBuffer)))
-						}
-						audioBuffer = []byte{}
-					default:
-						// Channel full, skip this chunk
-						logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Audio channel full, dropping chunk", esn))
-					}
-				}
-			} else {
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Unknown message type: %d", esn, messageType))
-			}
-		}
-	}()
+	// No separate reader goroutine - using connection manager's reader
+	// LLM handler will receive messages from connection manager's reader goroutine
+	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Using connection manager's reader goroutine (no separate reader)", esn))
 
 	// Text query was already sent above (after hello response)
 	// Now we wait for LLM response from the server
+	// Messages will be handled by connection manager's reader goroutine and routed to LLM handler
 
-	// Play audio chunks to robot - Real-time streaming
-	// Audio from xiaozhi is Opus-encoded at 24kHz (raw OPUS frames, not OGG)
-	// Strategy: Receive OPUS chunk → Decode → Downsample → Send immediately (real-time)
-	// Note: If robot is not available, skip audio processing but continue with text response
+	// Send text query (we need to convert to audio first)
+	// For now, we'll send a simple text message
+	// In production, you'd use TTS to convert text to Opus audio first
+	logger.Println("Xiaozhi KG: Sending query: " + transcribedText)
+
+	// Note: xiaozhi expects audio input, so we need to handle text differently
+	// For now, we'll just wait for response
+
+	// Play audio chunks to robot
+	// Audio from xiaozhi is Opus-encoded at 24kHz
+	// We need to: Decode Opus → PCM → Downsample 24k→16k → Send to robot
 	go func() {
+		// Capture audioCancelSafe to cancel audio context when done
+		// This ensures audioCtx is canceled when audio processing completes
+		defer audioCancelSafe()
 		// Wait for previous audio to finish and start new audio queue
 		WaitForAudio_Queue(esn)
 		StartAudio_Queue(esn)
@@ -689,7 +575,7 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 		logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ vclient is ready, starting audio processing", esn))
 
 		// Create Opus decoder for 24kHz, mono
-		opusDecoder, err := opuslib.NewDecoder(24000, 1)
+		opusDecoder, err := opus.NewDecoder(24000, 1)
 		if err != nil {
 			logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ERROR - Failed to create Opus decoder: %v", esn, err))
 			return
@@ -697,11 +583,37 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 		logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | Opus decoder created, ready for real-time streaming", esn))
 
 		// Process OPUS chunks in real-time - same approach as /api-sdk/play_sound
-		// Simple and direct: decode → downsample → send with 60ms delay (like play_sound)
+		// Accumulate chunks to 1024 bytes before sending (like /api-sdk/play_sound)
+		// But also send buffer if it's been waiting too long (>200ms) to avoid audio delay
+		chunkCount := 0                                      // Track total chunks sent (moved outside loop to prevent reset)
+		decodedFrameCount := 0                               // Track decoded frames for logging
+		accumulatedBuffer := []byte{}                        // Accumulate chunks until we have 1024 bytes
+		lastSendTime := time.Now()                           // Track when we last sent audio
+		flushTimer := time.NewTicker(200 * time.Millisecond) // Flush buffer every 200ms if not empty
+		defer flushTimer.Stop()
 		for {
 			select {
 			case <-done:
-				// TTS complete, send final completion
+				// TTS complete, send final buffer and completion
+				if vclient != nil && len(accumulatedBuffer) > 0 {
+					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | 📤 Sending final buffer (%d bytes) before completion", esn, len(accumulatedBuffer)))
+					err := vclient.Send(&vectorpb.ExternalAudioStreamRequest{
+						AudioRequestType: &vectorpb.ExternalAudioStreamRequest_AudioStreamChunk{
+							AudioStreamChunk: &vectorpb.ExternalAudioStreamChunk{
+								AudioChunkSizeBytes: uint32(len(accumulatedBuffer)),
+								AudioChunkSamples:   accumulatedBuffer,
+							},
+						},
+					})
+					if err != nil {
+						logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  ERROR - Failed to send final audio chunk: %v", esn, err))
+					} else {
+						chunkCount++
+						logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ Sent final audio chunk %d to robot (%d bytes)", esn, chunkCount, len(accumulatedBuffer)))
+						time.Sleep(time.Millisecond * 60)
+					}
+				}
+				// Send completion
 				if vclient != nil {
 					err := vclient.Send(&vectorpb.ExternalAudioStreamRequest{
 						AudioRequestType: &vectorpb.ExternalAudioStreamRequest_AudioStreamComplete{
@@ -717,15 +629,52 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 				return
 			case chunk, ok := <-audioChunks:
 				if !ok {
-					// Channel closed
+					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | Audio channel closed, sending final buffer", esn))
+					// Channel closed - send any remaining accumulated data
+					if vclient != nil && len(accumulatedBuffer) > 0 {
+						err := vclient.Send(&vectorpb.ExternalAudioStreamRequest{
+							AudioRequestType: &vectorpb.ExternalAudioStreamRequest_AudioStreamChunk{
+								AudioStreamChunk: &vectorpb.ExternalAudioStreamChunk{
+									AudioChunkSizeBytes: uint32(len(accumulatedBuffer)),
+									AudioChunkSamples:   accumulatedBuffer,
+								},
+							},
+						})
+						if err != nil {
+							logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  ERROR - Failed to send final audio chunk: %v", esn, err))
+						} else {
+							chunkCount++
+							logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ Sent final audio chunk %d to robot (%d bytes)", esn, chunkCount, len(accumulatedBuffer)))
+						}
+						time.Sleep(time.Millisecond * 60)
+					}
+					// Send completion
+					if vclient != nil {
+						err := vclient.Send(&vectorpb.ExternalAudioStreamRequest{
+							AudioRequestType: &vectorpb.ExternalAudioStreamRequest_AudioStreamComplete{
+								AudioStreamComplete: &vectorpb.ExternalAudioStreamComplete{},
+							},
+						})
+						if err != nil {
+							logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  ERROR - Failed to send AudioStreamComplete: %v", esn, err))
+						} else {
+							logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ Audio stream complete sent to robot", esn))
+						}
+					}
 					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | Audio channel closed, exiting", esn))
 					return
 				}
 				if len(chunk) == 0 {
+					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | Received empty audio chunk, skipping", esn))
 					continue
 				}
 
+				logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ Received audio chunk from handler: %d bytes", esn, len(chunk)))
+
+				// If vclient is nil (closed), continue receiving frames to avoid blocking handler
+				// but skip processing (decode, resample, send) since we can't send anymore
 				if vclient == nil {
+					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  vclient is nil, skipping audio chunk processing (will continue receiving to avoid blocking handler)", esn))
 					continue
 				}
 
@@ -733,11 +682,19 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 				pcmBuffer := make([]int16, 1440) // 60ms @ 24kHz max
 				n, err := opusDecoder.Decode(chunk, pcmBuffer)
 				if err != nil {
-					// Skip corrupted frames silently
+					// Log decode errors to debug
+					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  Opus decode error (skipping frame): %v, chunk size: %d bytes", esn, err, len(chunk)))
 					continue
 				}
 				if n == 0 {
+					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  Opus decode returned 0 samples, chunk size: %d bytes", esn, len(chunk)))
 					continue
+				}
+
+				// Log successful decode (first few frames and every 10th frame)
+				decodedFrameCount++
+				if decodedFrameCount == 1 || decodedFrameCount%10 == 0 {
+					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ Opus decoded: %d samples (from %d bytes Opus frame, frame #%d)", esn, n, len(chunk), decodedFrameCount))
 				}
 
 				// Convert int16 → PCM bytes (little-endian)
@@ -750,31 +707,45 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 				// Resample 24kHz → 8kHz (simple linear interpolation, like Play Audio)
 				downsampledChunks := resample24kTo8kSimple(framePCMBytes)
 				if len(downsampledChunks) == 0 {
+					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  Resample returned empty, skipping (PCM: %d bytes)", esn, len(framePCMBytes)))
 					continue
 				}
 
-				// Send chunks immediately with 60ms delay (same as /api-sdk/play_sound)
-				chunkCount := 0
+				// Accumulate all downsampled chunks into buffer
+				downsampledSize := 0
 				for _, c := range downsampledChunks {
+					accumulatedBuffer = append(accumulatedBuffer, c...)
+					downsampledSize += len(c)
+				}
+
+				// Log buffer status (first few times and when buffer is growing)
+				if decodedFrameCount <= 5 || len(accumulatedBuffer) >= 1024 {
+					logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | 📊 Buffer status: accumulated=%d bytes (from %d bytes downsampled), ready to send: %v", esn, len(accumulatedBuffer), downsampledSize, len(accumulatedBuffer) >= 1024))
+				}
+
+				// Send 1024-byte chunks (like /api-sdk/play_sound)
+				// /api-sdk/play_sound only sends chunks >= 1024 bytes
+				// Keep sending until buffer is less than 1024 bytes
+				sentInThisIteration := 0
+				for len(accumulatedBuffer) >= 1024 {
+					lastSendTime = time.Now() // Update last send time
 					if vclient == nil {
-						logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  vclient became nil during sending, stopping", esn))
-						break
+						logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  vclient became nil during sending, stopping audio processing", esn))
+						// Signal done channel to stop processing gracefully
+						select {
+						case done <- true:
+						default:
+						}
+						return
 					}
 
-					// Pad to 1024 bytes if needed
-					chunkToSend := c
-					if len(c) < 1024 {
-						paddedChunk := make([]byte, 1024)
-						copy(paddedChunk, c)
-						chunkToSend = paddedChunk
-					} else if len(c) > 1024 {
-						chunkToSend = c[:1024]
-					}
+					chunkToSend := accumulatedBuffer[:1024]
+					accumulatedBuffer = accumulatedBuffer[1024:]
 
 					err := vclient.Send(&vectorpb.ExternalAudioStreamRequest{
 						AudioRequestType: &vectorpb.ExternalAudioStreamRequest_AudioStreamChunk{
 							AudioStreamChunk: &vectorpb.ExternalAudioStreamChunk{
-								AudioChunkSizeBytes: 1024,
+								AudioChunkSizeBytes: 1024, // Always 1024 bytes (like /api-sdk/play_sound)
 								AudioChunkSamples:   chunkToSend,
 							},
 						},
@@ -782,18 +753,58 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 					if err != nil {
 						logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  ERROR - Failed to send audio chunk: %v", esn, err))
 						if strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "closed") {
+							logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  vclient connection closed (EOF/closed), will continue receiving frames but not sending", esn))
 							vclient = nil
-							break
+							// Don't return here - continue receiving frames from channel to avoid blocking handler
+							// Exit will happen when channel is closed (TTS stop)
+							// Clear accumulated buffer since we can't send anymore
+							accumulatedBuffer = []byte{}
+							break // Break out of the inner for loop, continue with outer select
 						}
 					} else {
 						chunkCount++
-						if chunkCount == 1 || chunkCount%10 == 0 {
-							logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ Sent audio chunk %d to robot (1024 bytes)", esn, chunkCount))
+						sentInThisIteration++
+						if chunkCount == 1 || chunkCount%10 == 0 || sentInThisIteration > 0 {
+							logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ Sent audio chunk %d to robot (1024 bytes), remaining buffer: %d bytes", esn, chunkCount, len(accumulatedBuffer)))
 						}
 					}
 
 					// Use 60ms delay (same as /api-sdk/play_sound which works well)
 					time.Sleep(time.Millisecond * 60)
+				}
+			case <-flushTimer.C:
+				// Flush buffer if it's been waiting too long (>200ms) and has data
+				// This ensures audio is sent even if buffer < 1024 bytes, preventing audio delay
+				if len(accumulatedBuffer) > 0 && time.Since(lastSendTime) > 200*time.Millisecond {
+					if vclient == nil {
+						logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  vclient is nil during flush, skipping", esn))
+						continue
+					}
+					// Send whatever we have (even if < 1024 bytes) to avoid delay
+					chunkToSend := accumulatedBuffer
+					accumulatedBuffer = []byte{} // Clear buffer
+					err := vclient.Send(&vectorpb.ExternalAudioStreamRequest{
+						AudioRequestType: &vectorpb.ExternalAudioStreamRequest_AudioStreamChunk{
+							AudioStreamChunk: &vectorpb.ExternalAudioStreamChunk{
+								AudioChunkSizeBytes: uint32(len(chunkToSend)),
+								AudioChunkSamples:   chunkToSend,
+							},
+						},
+					})
+					if err != nil {
+						logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  ERROR - Failed to send flushed audio chunk: %v", esn, err))
+						if strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "closed") {
+							logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ⚠️  vclient connection closed during flush, will continue receiving frames but not sending", esn))
+							vclient = nil
+							// Don't return here - continue receiving frames from channel to avoid blocking handler
+							// Exit will happen when channel is closed (TTS stop)
+						}
+					} else {
+						chunkCount++
+						logger.Println(fmt.Sprintf("[Xiaozhi TTS] Device: %s | ✅ Flushed audio chunk %d to robot (%d bytes) after 200ms timeout", esn, chunkCount, len(chunkToSend)))
+						lastSendTime = time.Now()
+						time.Sleep(time.Millisecond * 60)
+					}
 				}
 			case err, ok := <-errChan:
 				if !ok {
@@ -808,16 +819,80 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 	}()
 
 	// Wait for completion
-	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⏳ Waiting for LLM response (timeout: 30s)...", esn))
+	// Ensure esn is not empty to avoid nil pointer issues
+	if esn == "" {
+		esn = "unknown"
+	}
+	// Use recover to prevent panic from logger
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// Log to stderr directly to avoid logger issues
+				fmt.Fprintf(os.Stderr, "[Xiaozhi KG] PANIC in logger (recovered): %v\n", r)
+			}
+		}()
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⏳ Waiting for LLM response (timeout: 30s)...", esn))
+	}()
 	select {
 	case text := <-textResponse:
-		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ========== LLM TEXT RESPONSE RECEIVED ==========", esn))
-		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ LLM response text: '%s'", esn, text))
-		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Text length: %d bytes", esn, len(text)))
-		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Text will be returned to caller", esn))
-		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ==============================================", esn))
-		// Wait a bit for audio to finish
-		time.Sleep(2 * time.Second)
+		// Ensure text is not nil/empty to avoid issues
+		if text == "" {
+			text = "(empty response)"
+		}
+		// Use recover to prevent panic from logger
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Log to stderr directly to avoid logger issues
+					fmt.Fprintf(os.Stderr, "[Xiaozhi KG] PANIC in logger (recovered): %v, esn: %s, text: %s\n", r, esn, text)
+				}
+			}()
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ========== LLM TEXT RESPONSE RECEIVED ==========", esn))
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ LLM response text: '%s'", esn, text))
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Text length: %d bytes", esn, len(text)))
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Text will be returned to caller", esn))
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ==============================================", esn))
+		}()
+
+		// Wait for TTS to complete before releasing connection
+		// Keep WebSocket reader goroutine running continuously (like xiaozhi-esp32-main)
+		// It will ignore messages when no LLM request is active
+		if connFromSTT {
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⏳ Waiting for TTS stop event before releasing connection (keeping reader goroutine running)...", esn))
+			// Wait for TTS stop event with timeout
+			select {
+			case <-ttsStopChan:
+				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ TTS stop event received", esn))
+				// Wait a bit for WebSocket reader goroutine to process remaining messages
+				time.Sleep(1 * time.Second)
+				// Deactivate LLM handler - connection manager's reader will route messages to STT handler
+				if deviceID != "" && connFromSTT {
+					llmHandler.SetActive(false)
+					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ LLM handler deactivated (connection manager will route to STT handler)", esn))
+				}
+				// Release connection (don't close it) so STT can reuse for next request
+				// This keeps the session alive for continuous conversation
+				if deviceID != "" {
+					xiaozhi.ReleaseConnection(deviceID)
+					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Connection released (STT handler will handle next request)", esn))
+				}
+			case <-time.After(30 * time.Second):
+				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Timeout waiting for TTS stop event (30s), releasing connection anyway", esn))
+				// Deactivate LLM handler - connection manager's reader will route messages to STT handler
+				if deviceID != "" && connFromSTT {
+					llmHandler.SetActive(false)
+					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ LLM handler deactivated (connection manager will route to STT handler)", esn))
+				}
+				// Release connection (don't close it) so STT can reuse for next request
+				if deviceID != "" {
+					xiaozhi.ReleaseConnection(deviceID)
+					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Connection released (STT handler will handle next request)", esn))
+				}
+			}
+		} else {
+			// For new connections, just wait a bit for audio to finish
+			time.Sleep(2 * time.Second)
+		}
 
 		// Check if conversation should continue (newVoiceRequest action)
 		// If conversation mode is enabled (either via SaveChat or explicit request), trigger continuous listening
@@ -834,13 +909,25 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 			logger.Println(fmt.Sprintf("Xiaozhi KG: Continuous conversation mode requested but robot %s not available", esn))
 		}
 
+		// Wait a bit for audio processing to complete before returning
+		// This ensures audioCtx is not canceled too early, allowing audio chunks to be sent
+		// Audio processing goroutine will cancel audioCtx when done
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⏳ Waiting for audio processing to complete before returning...", esn))
+		time.Sleep(2 * time.Second) // Give audio processing time to finish sending remaining chunks
+
+		// Don't cancel audioCtx here - let audio processing goroutine cancel it when done
+		// This prevents vclient stream from closing while audio is still being sent
 		return text, nil
 	case <-time.After(30 * time.Second):
 		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ❌ TIMEOUT - No LLM response received after 30 seconds", esn))
 		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Debug info: textResponse channel length=%d, errChan length=%d", esn, len(textResponse), len(errChan)))
+		// Cancel audioCtx on timeout (error path)
+		audioCancelSafe()
 		return "", fmt.Errorf("timeout waiting for response")
 	case err := <-errChan:
 		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ❌ Error received from errChan: %v", esn, err))
+		// Cancel audioCtx on error (error path)
+		audioCancelSafe()
 		return "", err
 	}
 }

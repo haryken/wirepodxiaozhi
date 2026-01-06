@@ -19,11 +19,15 @@ func (s *Server) ProcessIntent(req *vtt.IntentRequest) (*vtt.IntentResponse, err
 		var err error
 		transcribedText, err = sttHandler(speechReq)
 		if err != nil {
-			ttr.IntentPass(req, "intent_system_noaudio", "voice processing error: "+err.Error(), map[string]string{"error": err.Error()}, true)
+			// Don't send intent_system_noaudio - it makes Vector show wifi icon which is annoying
+			// Just return silently without sending any intent to Vector
+			logger.Println("Bot " + speechReq.Device + " STT error: " + err.Error() + ", not sending intent to avoid wifi icon")
 			return nil, nil
 		}
 		if strings.TrimSpace(transcribedText) == "" {
-			ttr.IntentPass(req, "intent_system_noaudio", "", map[string]string{}, false)
+			// Don't send intent_system_noaudio for empty transcript - it makes Vector show wifi icon
+			// Just return silently without sending any intent to Vector
+			logger.Println("Bot " + speechReq.Device + " STT returned empty transcript, not sending intent to avoid wifi icon")
 			return nil, nil
 		}
 		successMatched = ttr.ProcessTextAll(req, transcribedText, vars.IntentList, speechReq.IsOpus)
