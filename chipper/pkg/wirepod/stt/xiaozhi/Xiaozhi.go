@@ -214,47 +214,68 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 	var connReused bool
 
 	if deviceID != "" {
-		// Check if connection exists and can be reused (not in use)
-		// Đợi cho đến khi connection được release (LLM xong) - không tạo connection mới
-		// Chỉ tạo connection mới khi connection cũ đã đóng hoàn toàn
-		maxWaitTime := 30 * time.Second // Đợi lâu hơn để LLM hoàn thành audio
-		waitInterval := 500 * time.Millisecond
-		waited := 0 * time.Millisecond
+		// First check if connection exists and is valid
+		// If connection doesn't exist or is closed, skip waiting and create new one
+		storedConn, storedSessionID, connectionExists := xiaozhi.CheckConnection(deviceID)
+		connectionValid := connectionExists && storedConn != nil && storedConn.RemoteAddr() != nil && xiaozhi.IsReaderRunning(deviceID)
 
-		// Đợi cho đến khi connection được release (LLM xong)
-		for xiaozhi.IsConnectionInUse(deviceID) && waited < maxWaitTime {
-			// Check context deadline
-			select {
-			case <-ctx.Done():
-				logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Context deadline exceeded while waiting for connection release (waited: %v)", waited))
-				return "", fmt.Errorf("context deadline exceeded while waiting for LLM to finish: %w", ctx.Err())
-			default:
+		// Only wait for LLM to finish if connection exists and is valid
+		if connectionValid && xiaozhi.IsConnectionInUse(deviceID) {
+			// Check if connection exists and can be reused (not in use)
+			// Đợi cho đến khi connection được release (LLM xong) - không tạo connection mới
+			// Chỉ tạo connection mới khi connection cũ đã đóng hoàn toàn
+			maxWaitTime := 30 * time.Second // Đợi lâu hơn để LLM hoàn thành audio
+			waitInterval := 500 * time.Millisecond
+			waited := 0 * time.Millisecond
+
+			// Đợi cho đến khi connection được release (LLM xong)
+			for xiaozhi.IsConnectionInUse(deviceID) && waited < maxWaitTime {
+				// Check context deadline
+				select {
+				case <-ctx.Done():
+					safeLog("Xiaozhi STT: ⚠️  Context deadline exceeded while waiting for connection release (waited: %v)", waited)
+					return "", fmt.Errorf("context deadline exceeded while waiting for LLM to finish: %w", ctx.Err())
+				default:
+				}
+
+				// Re-check if connection is still valid (might have been closed)
+				if storedConn, _, exists := xiaozhi.CheckConnection(deviceID); !exists || storedConn == nil || storedConn.RemoteAddr() == nil || !xiaozhi.IsReaderRunning(deviceID) {
+					safeLog("Xiaozhi STT: ⚠️  Connection was closed while waiting for LLM, will create new connection")
+					connectionValid = false
+					break
+				}
+
+				safeLog("Xiaozhi STT: ⏳ Connection for device %s is IN USE by LLM, waiting for release (waited: %v)...", deviceID, waited)
+
+				// Use context-aware sleep
+				select {
+				case <-ctx.Done():
+					safeLog("Xiaozhi STT: ⚠️  Context deadline exceeded while waiting for connection release (waited: %v)", waited)
+					return "", fmt.Errorf("context deadline exceeded while waiting for LLM to finish: %w", ctx.Err())
+				case <-time.After(waitInterval):
+					waited += waitInterval
+				}
 			}
 
-			logger.Println(fmt.Sprintf("Xiaozhi STT: ⏳ Connection for device %s is IN USE by LLM, waiting for release (waited: %v)...", deviceID, waited))
-
-			// Use context-aware sleep
-			select {
-			case <-ctx.Done():
-				logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Context deadline exceeded while waiting for connection release (waited: %v)", waited))
-				return "", fmt.Errorf("context deadline exceeded while waiting for LLM to finish: %w", ctx.Err())
-			case <-time.After(waitInterval):
-				waited += waitInterval
+			if waited >= maxWaitTime {
+				safeLog("Xiaozhi STT: ⚠️  Connection for device %s still IN USE after %v, timeout - connection may be stuck", deviceID, maxWaitTime)
+				return "", fmt.Errorf("connection for device %s is still in use by LLM after %v, cannot proceed", deviceID, maxWaitTime)
+			} else if waited > 0 && connectionValid {
+				safeLog("Xiaozhi STT: ✅ Connection for device %s released after %v, waiting a bit more for LLM reader to fully stop...", deviceID, waited)
+				// Wait a bit more to ensure LLM reader goroutine has fully stopped
+				time.Sleep(200 * time.Millisecond)
 			}
 		}
 
-		if waited >= maxWaitTime {
-			logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Connection for device %s still IN USE after %v, timeout - connection may be stuck", deviceID, maxWaitTime))
-			return "", fmt.Errorf("connection for device %s is still in use by LLM after %v, cannot proceed", deviceID, maxWaitTime)
-		} else if waited > 0 {
-			logger.Println(fmt.Sprintf("Xiaozhi STT: ✅ Connection for device %s released after %v, waiting a bit more for LLM reader to fully stop...", deviceID, waited))
-			// Wait a bit more to ensure LLM reader goroutine has fully stopped
-			time.Sleep(200 * time.Millisecond)
+		// Re-check connection after waiting (it might have been closed)
+		if connectionValid {
+			storedConn, storedSessionID, connectionExists = xiaozhi.CheckConnection(deviceID)
+			connectionValid = connectionExists && storedConn != nil && storedConn.RemoteAddr() != nil && xiaozhi.IsReaderRunning(deviceID)
 		}
 
 		// Check if connection exists and can be reused (not in use)
-		if storedConn, storedSessionID, exists := xiaozhi.CheckConnection(deviceID); exists {
-			logger.Println(fmt.Sprintf("Xiaozhi STT: 🔍 Found existing connection for device %s (sessionID: %s), verifying validity...", deviceID, storedSessionID))
+		if connectionValid {
+			safeLog("Xiaozhi STT: 🔍 Found existing connection for device %s (sessionID: %s), verifying validity...", deviceID, storedSessionID)
 
 			// First check if reader goroutine is still running
 			// If reader is not running, connection has likely failed
@@ -306,21 +327,34 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 
 	// Nếu không có connection để reuse, tạo connection mới
 	if !connReused {
+		// Check context before creating new connection
+		select {
+		case <-ctx.Done():
+			safeLog("Xiaozhi STT: ⚠️  Context canceled before creating new connection: %v", ctx.Err())
+			return "", fmt.Errorf("context canceled before creating new connection: %w", ctx.Err())
+		default:
+		}
+
 		// Log tất cả headers được gửi để debug
-		logger.Println(fmt.Sprintf("Xiaozhi STT: Connecting to %s with headers:", baseURL))
+		safeLog("Xiaozhi STT: Connecting to %s with headers:", baseURL)
 		for key, values := range headers {
 			for _, value := range values {
-				logger.Println(fmt.Sprintf("  %s: %s", key, value))
+				safeLog("  %s: %s", key, value)
 			}
 		}
 
 		var err error
 		conn, _, err = websocket.DefaultDialer.DialContext(ctx, baseURL, headers)
 		if err != nil {
-			logger.Println("Xiaozhi STT: Failed to connect:", err)
+			// Check if error is due to context cancellation
+			if ctx.Err() != nil {
+				safeLog("Xiaozhi STT: ⚠️  Context canceled during connection: %v", ctx.Err())
+				return "", fmt.Errorf("context canceled during connection: %w", ctx.Err())
+			}
+			safeLog("Xiaozhi STT: Failed to connect: %v", err)
 			return "", fmt.Errorf("failed to connect to xiaozhi: %w", err)
 		}
-		logger.Println("Xiaozhi STT: ✅ New WebSocket connection created")
+		safeLog("Xiaozhi STT: ✅ New WebSocket connection created")
 
 		// Set PongHandler to automatically respond to server pings
 		// This helps keep connection alive - server may send ping and expect pong
