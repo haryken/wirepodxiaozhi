@@ -183,19 +183,37 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 
 	if deviceID != "" {
 		// Check if connection exists and can be reused (not in use)
-		// Đợi một chút nếu connection đang in use để LLM reader có thời gian dừng
-		maxWaitTime := 2 * time.Second
-		waitInterval := 100 * time.Millisecond
+		// Đợi cho đến khi connection được release (LLM xong) - không tạo connection mới
+		// Chỉ tạo connection mới khi connection cũ đã đóng hoàn toàn
+		maxWaitTime := 30 * time.Second // Đợi lâu hơn để LLM hoàn thành audio
+		waitInterval := 500 * time.Millisecond
 		waited := 0 * time.Millisecond
 
+		// Đợi cho đến khi connection được release (LLM xong)
 		for xiaozhi.IsConnectionInUse(deviceID) && waited < maxWaitTime {
+			// Check context deadline
+			select {
+			case <-ctx.Done():
+				logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Context deadline exceeded while waiting for connection release (waited: %v)", waited))
+				return "", fmt.Errorf("context deadline exceeded while waiting for LLM to finish: %w", ctx.Err())
+			default:
+			}
+
 			logger.Println(fmt.Sprintf("Xiaozhi STT: ⏳ Connection for device %s is IN USE by LLM, waiting for release (waited: %v)...", deviceID, waited))
-			time.Sleep(waitInterval)
-			waited += waitInterval
+
+			// Use context-aware sleep
+			select {
+			case <-ctx.Done():
+				logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Context deadline exceeded while waiting for connection release (waited: %v)", waited))
+				return "", fmt.Errorf("context deadline exceeded while waiting for LLM to finish: %w", ctx.Err())
+			case <-time.After(waitInterval):
+				waited += waitInterval
+			}
 		}
 
 		if waited >= maxWaitTime {
-			logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Connection for device %s still IN USE after %v, creating new connection", deviceID, maxWaitTime))
+			logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Connection for device %s still IN USE after %v, timeout - connection may be stuck", deviceID, maxWaitTime))
+			return "", fmt.Errorf("connection for device %s is still in use by LLM after %v, cannot proceed", deviceID, maxWaitTime)
 		} else if waited > 0 {
 			logger.Println(fmt.Sprintf("Xiaozhi STT: ✅ Connection for device %s released after %v, waiting a bit more for LLM reader to fully stop...", deviceID, waited))
 			// Wait a bit more to ensure LLM reader goroutine has fully stopped
@@ -205,7 +223,7 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 		// Check if connection exists and can be reused (not in use)
 		if storedConn, storedSessionID, exists := xiaozhi.CheckConnection(deviceID); exists {
 			logger.Println(fmt.Sprintf("Xiaozhi STT: 🔍 Found existing connection for device %s (sessionID: %s), verifying validity...", deviceID, storedSessionID))
-			
+
 			// First check if reader goroutine is still running
 			// If reader is not running, connection has likely failed
 			if !xiaozhi.IsReaderRunning(deviceID) {
@@ -271,14 +289,14 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 			return "", fmt.Errorf("failed to connect to xiaozhi: %w", err)
 		}
 		logger.Println("Xiaozhi STT: ✅ New WebSocket connection created")
-		
+
 		// Set PongHandler to automatically respond to server pings
 		// This helps keep connection alive - server may send ping and expect pong
 		conn.SetPongHandler(func(appData string) error {
 			logger.Println(fmt.Sprintf("Xiaozhi STT: ✅ Received pong from server for device %s", deviceID))
 			return nil
 		})
-		
+
 		// Set PingHandler to automatically respond to server pings (if server sends ping)
 		conn.SetPingHandler(func(appData string) error {
 			logger.Println(fmt.Sprintf("Xiaozhi STT: ✅ Received ping from server for device %s, sending pong", deviceID))
@@ -288,7 +306,7 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 			conn.SetWriteDeadline(time.Time{})
 			return err
 		})
-		
+
 		// KHÔNG đóng connection ngay - LLM sẽ dùng lại connection này (giống botkct.py)
 		// Connection sẽ được đóng sau khi LLM xong hoặc sau timeout
 		// defer conn.Close() // REMOVED - để LLM có thể dùng lại connection
@@ -431,9 +449,9 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 			"transport": "websocket",
 			"features": map[string]interface{}{
 				"audio": map[string]interface{}{
-					"codecs": []string{"opus"},
+					"codecs":      []string{"opus"},
 					"sample_rate": 16000,
-					"channels": 1,
+					"channels":    1,
 				},
 			},
 			"language": "vi",
@@ -556,7 +574,12 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 	// Store connection and start reader goroutine (if new connection)
 	// If reusing connection, reader goroutine is already running
 	if !connReused && deviceID != "" {
-		xiaozhi.StoreConnection(deviceID, conn, sessionID)
+		// Store connection - should not fail now since we already waited for LLM to finish
+		if err := xiaozhi.StoreConnection(deviceID, conn, sessionID); err != nil {
+			logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Failed to store connection: %v. This should not happen after waiting for LLM to finish.", err))
+			conn.Close()
+			return "", fmt.Errorf("failed to store connection after waiting for LLM: %w", err)
+		}
 		logger.Println(fmt.Sprintf("Xiaozhi STT: Stored NEW connection for device %s (sessionID: %s) - reader goroutine started", deviceID, sessionID))
 	}
 
@@ -602,7 +625,7 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 		// Initialize VAD detection
 		sreq.DetectEndOfSpeech()
 
-		chunkCount := 0 // Đếm số chunks đã gửi để log
+		chunkCount := 0         // Đếm số chunks đã gửi để log
 		listenStopSent := false // Flag để đảm bảo chỉ gửi listen stop event một lần
 
 		// KHÔNG gửi FirstReq (OpusHead/OpusTags) vì:
@@ -946,7 +969,7 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 		}
 
 		// Connection already stored in manager (if new connection) or already exists (if reused)
-		// Just deactivate STT handler when done
+		// Handle empty transcript case: keep handler active if transcript is empty
 		if deviceID != "" {
 			// Check if connection is actually closed or failed
 			if failed || conn.RemoteAddr() == nil {
@@ -957,8 +980,13 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 				} else {
 					conn.Close()
 				}
+			} else if transcript == "" {
+				// Empty transcript - keep STT handler active to handle server messages
+				// This prevents "No active handler" errors when server sends messages
+				logger.Println(fmt.Sprintf("Xiaozhi STT: Empty transcript received, keeping STT handler active for device %s (sessionID: %s) to handle server messages", deviceID, sessionID))
+				// Don't deactivate handler - it will be deactivated when next STT request comes or connection closes
 			} else {
-				// Deactivate STT handler - connection manager's reader will continue for LLM
+				// Non-empty transcript - deactivate STT handler, LLM will take over
 				sttHandler.SetActive(false)
 				logger.Println(fmt.Sprintf("Xiaozhi STT: STT handler deactivated for device %s (sessionID: %s) - connection kept for LLM", deviceID, sessionID))
 			}

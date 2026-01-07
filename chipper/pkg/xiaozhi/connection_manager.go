@@ -240,12 +240,27 @@ func SetLLMHandler(deviceID string, handler MessageHandler) {
 // StoreConnection stores a WebSocket connection for a device
 // This is called by STT after establishing connection
 // Starts the single reader goroutine (like go-xiaozhi-main)
-func StoreConnection(deviceID string, conn *websocket.Conn, sessionID string) {
+// Returns error if old connection is in use by LLM
+func StoreConnection(deviceID string, conn *websocket.Conn, sessionID string) error {
 	connManager.mu.Lock()
 	defer connManager.mu.Unlock()
 
-	// Close old connection if exists
+	// Close old connection if exists, BUT NOT if it's currently in use by LLM
 	if oldConnInfo, exists := connManager.connections[deviceID]; exists && oldConnInfo.Conn != nil {
+		// Check if old connection is in use
+		oldConnInfo.mu.RLock()
+		inUse := oldConnInfo.InUse
+		oldConnInfo.mu.RUnlock()
+		
+		if inUse {
+			// Old connection is in use by LLM, don't close it
+			// This prevents interrupting LLM audio playback
+			logger.Println(fmt.Sprintf("[ConnectionManager] ⚠️  Old connection for device %s is IN USE by LLM, cannot replace it. New connection will not be stored.", deviceID))
+			// Close the new connection since we can't use it
+			conn.Close()
+			return fmt.Errorf("connection for device %s is in use by LLM, cannot store new connection", deviceID)
+		}
+		
 		logger.Println(fmt.Sprintf("[ConnectionManager] Closing old connection for device: %s", deviceID))
 		// Stop old reader
 		if oldConnInfo.ReaderRunning {
@@ -269,6 +284,7 @@ func StoreConnection(deviceID string, conn *websocket.Conn, sessionID string) {
 
 	// Start reader goroutine (like go-xiaozhi-main)
 	go StartReader(deviceID, conn, sessionID)
+	return nil
 }
 
 // IsConnectionValid checks if a WebSocket connection is still valid

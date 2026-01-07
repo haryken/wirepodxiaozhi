@@ -462,7 +462,11 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 
 		// Store new connection in manager and start reader (like STT does)
 		if deviceID != "" {
-			xiaozhi.StoreConnection(deviceID, conn, sessionID)
+			if err := xiaozhi.StoreConnection(deviceID, conn, sessionID); err != nil {
+				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Failed to store connection: %v", esn, err))
+				conn.Close()
+				return "", fmt.Errorf("failed to store connection: %w", err)
+			}
 			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Stored NEW connection for device %s (sessionID: %s) - reader goroutine started", esn, deviceID, sessionID))
 			// Mark connection as "in use" for LLM
 			xiaozhi.GetConnection(deviceID) // This marks it as "in use"
@@ -950,7 +954,11 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Timeout waiting for audio processing (10s), proceeding anyway", esn))
 				}
 				// Wait a bit for WebSocket reader goroutine to process remaining messages
-				time.Sleep(1 * time.Second)
+				// Don't deactivate LLM handler or release connection immediately
+				// Keep handler active to receive any remaining messages from server
+				// This prevents server from closing connection prematurely
+				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⏳ Waiting a bit more for server to send any remaining messages...", esn))
+				time.Sleep(2 * time.Second) // Wait longer to ensure server doesn't close connection
 				// Deactivate LLM handler - connection manager's reader will route messages to STT handler
 				if deviceID != "" && connFromSTT {
 					llmHandler.SetActive(false)
@@ -965,7 +973,10 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 			case <-audioProcessingDone:
 				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Audio processing completed (audio channel closed)", esn))
 				// Wait a bit for WebSocket reader goroutine to process remaining messages
-				time.Sleep(1 * time.Second)
+				// Don't deactivate LLM handler or release connection immediately
+				// Keep handler active to receive any remaining messages from server
+				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⏳ Waiting a bit more for server to send any remaining messages...", esn))
+				time.Sleep(2 * time.Second) // Wait longer to ensure server doesn't close connection
 				// Deactivate LLM handler - connection manager's reader will route messages to STT handler
 				if deviceID != "" && connFromSTT {
 					llmHandler.SetActive(false)
