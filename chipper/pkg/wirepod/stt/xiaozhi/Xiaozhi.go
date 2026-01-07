@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -58,31 +59,49 @@ func (h *STTHandler) HandleMessage(messageType int, message []byte) error {
 		case "stt":
 			if text, ok := event["text"].(string); ok && text != "" {
 				logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ✅ STT transcript: '%s'", text))
-				select {
-				case h.transcriptChan <- text:
-					logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ✅ Transcript sent to channel: '%s'", text))
-					h.mu.Lock()
-					h.transcriptReceived = true
-					h.mu.Unlock()
-				default:
-					logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ⚠️  transcriptChan is full, dropping transcript"))
-				}
+				// Use recover to handle panic if channel is closed
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							// Channel is closed - this can happen if STT request completed but ConnectionManager
+							// still receives messages from the server
+							logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ⚠️  transcriptChan is closed, dropping transcript (recovered from panic: %v)", r))
+						}
+					}()
+					select {
+					case h.transcriptChan <- text:
+						logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ✅ Transcript sent to channel: '%s'", text))
+						h.mu.Lock()
+						h.transcriptReceived = true
+						h.mu.Unlock()
+					default:
+						logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ⚠️  transcriptChan is full, dropping transcript"))
+					}
+				}()
 			}
 		case "error":
-			select {
-			case h.errorOccurred <- struct{}{}:
-			default:
-			}
-			errorMsg := "unknown error"
-			if msg, ok := event["error"].(string); ok {
-				errorMsg = msg
-			} else if msg, ok := event["message"].(string); ok {
-				errorMsg = msg
-			}
-			select {
-			case h.errChan <- fmt.Errorf("xiaozhi error: %s", errorMsg):
-			default:
-			}
+			// Use recover to handle panic if channels are closed
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ⚠️  error channels are closed, dropping error (recovered from panic: %v)", r))
+					}
+				}()
+				select {
+				case h.errorOccurred <- struct{}{}:
+				default:
+				}
+				errorMsg := "unknown error"
+				if msg, ok := event["error"].(string); ok {
+					errorMsg = msg
+				} else if msg, ok := event["message"].(string); ok {
+					errorMsg = msg
+				}
+				select {
+				case h.errChan <- fmt.Errorf("xiaozhi error: %s", errorMsg):
+				default:
+				}
+			}()
 		}
 	}
 	return nil
@@ -118,7 +137,19 @@ func Init() error {
 }
 
 func STT(sreq sr.SpeechRequest) (string, error) {
-	logger.Println("(Bot " + sreq.Device + ", Xiaozhi) Processing...")
+	// Helper function to safely log messages (with recover to prevent logger panics)
+	safeLog := func(format string, args ...interface{}) {
+		defer func() {
+			if r := recover(); r != nil {
+				// Log to stderr if logger panics
+				fmt.Fprintf(os.Stderr, "[Xiaozhi STT] [logger panic recovered: %v] ", r)
+				fmt.Fprintf(os.Stderr, format+"\n", args...)
+			}
+		}()
+		logger.Println(fmt.Sprintf(format, args...))
+	}
+
+	safeLog("(Bot %s, Xiaozhi) Processing...", sreq.Device)
 
 	// Get xiaozhi config
 	baseURL, _, _ := xiaozhi.GetKnowledgeGraphConfig()
@@ -127,7 +158,8 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 	}
 
 	// Connect to xiaozhi WebSocket (using xiaozhi protocol)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Increased timeout to 90 seconds to allow longer speech input
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	// Lấy Device-Id và Client-Id từ config
@@ -974,10 +1006,10 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 	}()
 
 	// Step 7: Wait for transcript or error
-	logger.Println("Xiaozhi STT: Waiting for transcript or error (timeout: 30s)")
+	safeLog("Xiaozhi STT: Waiting for transcript or error (timeout: 90s)")
 	select {
 	case transcript := <-transcriptChan:
-		logger.Println(fmt.Sprintf("Xiaozhi STT: SUCCESS - Received transcript for device %s: %s", sreq.Device, transcript))
+		safeLog("Xiaozhi STT: SUCCESS - Received transcript for device %s: %s", sreq.Device, transcript)
 
 		// Check if connection failed before storing
 		failed := false
@@ -991,7 +1023,7 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 		if deviceID != "" {
 			// Check if connection is actually closed or failed
 			if failed || conn.RemoteAddr() == nil {
-				logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Connection failed or invalid, closing"))
+				safeLog("Xiaozhi STT: ⚠️  Connection failed or invalid, closing")
 				// Close and remove invalid connection
 				if connReused {
 					xiaozhi.CloseConnection(deviceID)
@@ -1001,21 +1033,21 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 			} else if transcript == "" {
 				// Empty transcript - keep STT handler active to handle server messages
 				// This prevents "No active handler" errors when server sends messages
-				logger.Println(fmt.Sprintf("Xiaozhi STT: Empty transcript received, keeping STT handler active for device %s (sessionID: %s) to handle server messages", deviceID, sessionID))
+				safeLog("Xiaozhi STT: Empty transcript received, keeping STT handler active for device %s (sessionID: %s) to handle server messages", deviceID, sessionID)
 				// Don't deactivate handler - it will be deactivated when next STT request comes or connection closes
 			} else {
 				// Non-empty transcript - deactivate STT handler, LLM will take over
 				sttHandler.SetActive(false)
-				logger.Println(fmt.Sprintf("Xiaozhi STT: STT handler deactivated for device %s (sessionID: %s) - connection kept for LLM", deviceID, sessionID))
+				safeLog("Xiaozhi STT: STT handler deactivated for device %s (sessionID: %s) - connection kept for LLM", deviceID, sessionID)
 			}
 		} else {
 			// Nếu không có deviceID, đóng connection ngay
-			logger.Println("Xiaozhi STT: No deviceID, closing connection immediately")
+			safeLog("Xiaozhi STT: No deviceID, closing connection immediately")
 			conn.Close()
 		}
 		return transcript, nil
 	case err := <-errChan:
-		logger.Println(fmt.Sprintf("Xiaozhi STT: ERROR - Received error from errChan for device %s: %v (type: %T)", sreq.Device, err, err))
+		safeLog("Xiaozhi STT: ERROR - Received error from errChan for device %s: %v (type: %T)", sreq.Device, err, err)
 		// Đóng connection nếu có lỗi
 		if deviceID != "" {
 			xiaozhi.CloseConnection(deviceID) // Đóng connection khi có lỗi
@@ -1026,11 +1058,11 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 	case <-ctx.Done():
 		// Context canceled - this is not a real error, just user cancel or timeout
 		// Don't close connection, just return empty transcript (connection will be kept for reuse)
-		logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Context canceled for device %s: %v - returning empty transcript, keeping connection", sreq.Device, ctx.Err()))
+		safeLog("Xiaozhi STT: ⚠️  Context canceled for device %s: %v - returning empty transcript, keeping connection", sreq.Device, ctx.Err())
 		// Don't close connection - let it be reused for next request
 		return "", nil // Return empty transcript, not error
-	case <-time.After(30 * time.Second):
-		logger.Println(fmt.Sprintf("Xiaozhi STT: ERROR - Timeout waiting for transcript for device %s (30s)", sreq.Device))
+	case <-time.After(90 * time.Second):
+		safeLog("Xiaozhi STT: ERROR - Timeout waiting for transcript for device %s (90s)", sreq.Device)
 		// Đóng connection nếu timeout
 		if deviceID != "" {
 			xiaozhi.CloseConnection(deviceID) // Đóng connection khi timeout
