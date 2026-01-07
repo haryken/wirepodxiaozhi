@@ -47,15 +47,14 @@ func resample24kTo8kSimple(input []byte) [][]byte {
 	outBytes := int16sToBytes(output)
 	var audioChunks [][]byte
 	// Chunk into 1024 bytes (like Play Audio)
-	for len(outBytes) > 0 {
-		if len(outBytes) < 1024 {
-			chunk := make([]byte, 1024)
-			copy(chunk, outBytes)
-			audioChunks = append(audioChunks, chunk)
-			break
-		}
+	// Don't pad with zeros - send exact size (padding zeros can cause audio issues)
+	for len(outBytes) >= 1024 {
 		audioChunks = append(audioChunks, outBytes[:1024])
 		outBytes = outBytes[1024:]
+	}
+	// If there's remaining data < 1024 bytes, include it (will be sent via flush timer)
+	if len(outBytes) > 0 {
+		audioChunks = append(audioChunks, outBytes)
 	}
 	return audioChunks
 }

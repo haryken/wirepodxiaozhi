@@ -19,6 +19,13 @@ func (s *Server) ProcessIntent(req *vtt.IntentRequest) (*vtt.IntentResponse, err
 		var err error
 		transcribedText, err = sttHandler(speechReq)
 		if err != nil {
+			// Check if error is "context canceled" - this is not a real error, just user cancel or timeout
+			// Treat it as empty transcript, don't send any intent to robot
+			errStr := err.Error()
+			if strings.Contains(errStr, "context canceled") || strings.Contains(errStr, "Canceled") {
+				logger.Println("Bot " + speechReq.Device + " STT context canceled (user cancel or timeout) - treating as empty transcript, not sending intent to avoid wifi icon")
+				return nil, nil
+			}
 			// Don't send intent_system_noaudio - it makes Vector show wifi icon which is annoying
 			// Just return silently without sending any intent to Vector
 			logger.Println("Bot " + speechReq.Device + " STT error: " + err.Error() + ", not sending intent to avoid wifi icon")

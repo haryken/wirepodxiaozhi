@@ -702,6 +702,24 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 						}
 						return
 					}
+					// Check if error is "context canceled" - this is not a real error, just user cancel or timeout
+					// Don't send to errChan, just return empty transcript (connection will be kept for reuse)
+					errStr := err.Error()
+					if strings.Contains(errStr, "context canceled") || strings.Contains(errStr, "Canceled") {
+						logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Context canceled while getting audio chunk (user cancel or timeout) - returning empty transcript, keeping connection"))
+						// Signal done to stop audio sending loop
+						select {
+						case done <- true:
+						default:
+						}
+						// Send empty transcript to transcriptChan (not error)
+						select {
+						case transcriptChan <- "":
+							logger.Println("Xiaozhi STT: Empty transcript sent to channel (context canceled)")
+						default:
+						}
+						return
+					}
 					// Try to send error, but don't panic if channel is closed
 					logger.Println(fmt.Sprintf("Xiaozhi STT: ERROR - Failed to get audio chunk: %v (type: %T)", err, err))
 					func() {
@@ -1006,14 +1024,11 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 		}
 		return "", err
 	case <-ctx.Done():
-		logger.Println(fmt.Sprintf("Xiaozhi STT: ERROR - Context canceled for device %s: %v", sreq.Device, ctx.Err()))
-		// Đóng connection nếu context canceled
-		if deviceID != "" {
-			xiaozhi.CloseConnection(deviceID) // Đóng connection khi context canceled
-		} else {
-			conn.Close()
-		}
-		return "", fmt.Errorf("context canceled: %w", ctx.Err())
+		// Context canceled - this is not a real error, just user cancel or timeout
+		// Don't close connection, just return empty transcript (connection will be kept for reuse)
+		logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Context canceled for device %s: %v - returning empty transcript, keeping connection", sreq.Device, ctx.Err()))
+		// Don't close connection - let it be reused for next request
+		return "", nil // Return empty transcript, not error
 	case <-time.After(30 * time.Second):
 		logger.Println(fmt.Sprintf("Xiaozhi STT: ERROR - Timeout waiting for transcript for device %s (30s)", sreq.Device))
 		// Đóng connection nếu timeout
