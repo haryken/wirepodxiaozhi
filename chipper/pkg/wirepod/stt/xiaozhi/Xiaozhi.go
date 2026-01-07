@@ -214,12 +214,12 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 	var connReused bool
 
 	if deviceID != "" {
-		// First check if connection exists and is valid
-		// If connection doesn't exist or is closed, skip waiting and create new one
-		storedConn, storedSessionID, connectionExists := xiaozhi.CheckConnection(deviceID)
+		// First check if connection exists and is valid (regardless of in-use status)
+		// This is important: we need to know if connection exists even if it's "in use"
+		storedConn, storedSessionID, connectionExists := xiaozhi.CheckConnectionExists(deviceID)
 		connectionValid := connectionExists && storedConn != nil && storedConn.RemoteAddr() != nil && xiaozhi.IsReaderRunning(deviceID)
 
-		// Only wait for LLM to finish if connection exists and is valid
+		// Only wait for LLM to finish if connection exists and is valid AND is in use
 		if connectionValid && xiaozhi.IsConnectionInUse(deviceID) {
 			// Check if connection exists and can be reused (not in use)
 			// Đợi cho đến khi connection được release (LLM xong) - không tạo connection mới
@@ -239,7 +239,8 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 				}
 
 				// Re-check if connection is still valid (might have been closed)
-				if storedConn, _, exists := xiaozhi.CheckConnection(deviceID); !exists || storedConn == nil || storedConn.RemoteAddr() == nil || !xiaozhi.IsReaderRunning(deviceID) {
+				// Use CheckConnectionExists to check if connection still exists (regardless of in-use status)
+				if storedConn, _, exists := xiaozhi.CheckConnectionExists(deviceID); !exists || storedConn == nil || storedConn.RemoteAddr() == nil || !xiaozhi.IsReaderRunning(deviceID) {
 					safeLog("Xiaozhi STT: ⚠️  Connection was closed while waiting for LLM, will create new connection")
 					connectionValid = false
 					break
@@ -268,8 +269,9 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 		}
 
 		// Re-check connection after waiting (it might have been closed)
+		// Use CheckConnectionExists to check if connection still exists (regardless of in-use status)
 		if connectionValid {
-			storedConn, storedSessionID, connectionExists = xiaozhi.CheckConnection(deviceID)
+			storedConn, storedSessionID, connectionExists = xiaozhi.CheckConnectionExists(deviceID)
 			connectionValid = connectionExists && storedConn != nil && storedConn.RemoteAddr() != nil && xiaozhi.IsReaderRunning(deviceID)
 		}
 
@@ -640,13 +642,48 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 	// Store connection and start reader goroutine (if new connection)
 	// If reusing connection, reader goroutine is already running
 	if !connReused && deviceID != "" {
-		// Store connection - should not fail now since we already waited for LLM to finish
-		if err := xiaozhi.StoreConnection(deviceID, conn, sessionID); err != nil {
-			logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Failed to store connection: %v. This should not happen after waiting for LLM to finish.", err))
-			conn.Close()
-			return "", fmt.Errorf("failed to store connection after waiting for LLM: %w", err)
+		// Store connection with retry logic (in case of race condition with LLM release)
+		maxRetries := 3
+		retryInterval := 200 * time.Millisecond
+		var storeErr error
+		for retry := 0; retry < maxRetries; retry++ {
+			storeErr = xiaozhi.StoreConnection(deviceID, conn, sessionID)
+			if storeErr == nil {
+				// Successfully stored
+				break
+			}
+			// Check if error is "in use" - this means LLM hasn't fully released yet
+			if strings.Contains(storeErr.Error(), "in use by LLM") {
+				if retry < maxRetries-1 {
+					safeLog("Xiaozhi STT: ⚠️  Connection still in use (retry %d/%d), waiting %v before retry...", retry+1, maxRetries, retryInterval)
+					// Wait a bit before retrying
+					select {
+					case <-ctx.Done():
+						conn.Close()
+						return "", fmt.Errorf("context canceled while retrying to store connection: %w", ctx.Err())
+					case <-time.After(retryInterval):
+						// Continue to retry
+					}
+				} else {
+					// Last retry failed
+					safeLog("Xiaozhi STT: ⚠️  Failed to store connection after %d retries: %v", maxRetries, storeErr)
+					conn.Close()
+					return "", fmt.Errorf("failed to store connection after %d retries: %w", maxRetries, storeErr)
+				}
+			} else {
+				// Different error - don't retry
+				safeLog("Xiaozhi STT: ⚠️  Failed to store connection (non-retryable error): %v", storeErr)
+				conn.Close()
+				return "", fmt.Errorf("failed to store connection: %w", storeErr)
+			}
 		}
-		logger.Println(fmt.Sprintf("Xiaozhi STT: Stored NEW connection for device %s (sessionID: %s) - reader goroutine started", deviceID, sessionID))
+		if storeErr != nil {
+			// All retries failed
+			safeLog("Xiaozhi STT: ⚠️  Failed to store connection after all retries: %v", storeErr)
+			conn.Close()
+			return "", fmt.Errorf("failed to store connection after all retries: %w", storeErr)
+		}
+		safeLog("Xiaozhi STT: Stored NEW connection for device %s (sessionID: %s) - reader goroutine started", deviceID, sessionID)
 	}
 
 	// Register STT handler with connection manager
@@ -768,10 +805,10 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 						}
 						return
 					}
-					// Check if error is "context canceled" - this is not a real error, just user cancel or timeout
+					// Check if error is "context canceled" or "DeadlineExceeded" - this is not a real error, just user cancel or timeout
 					// Don't send to errChan, just return empty transcript (connection will be kept for reuse)
 					errStr := err.Error()
-					if strings.Contains(errStr, "context canceled") || strings.Contains(errStr, "Canceled") {
+					if strings.Contains(errStr, "context canceled") || strings.Contains(errStr, "DeadlineExceeded") || strings.Contains(errStr, "deadline exceeded") || strings.Contains(errStr, "Canceled") {
 						logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Context canceled while getting audio chunk (user cancel or timeout) - returning empty transcript, keeping connection"))
 						// Signal done to stop audio sending loop
 						select {
@@ -1081,8 +1118,18 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 		}
 		return transcript, nil
 	case err := <-errChan:
+		// Check if error is "DeadlineExceeded" or "context canceled" - treat as empty transcript, don't close connection
+		errStr := ""
+		if err != nil {
+			errStr = err.Error()
+		}
+		if strings.Contains(errStr, "DeadlineExceeded") || strings.Contains(errStr, "deadline exceeded") || strings.Contains(errStr, "context canceled") || strings.Contains(errStr, "Canceled") {
+			safeLog("Xiaozhi STT: ⚠️  DeadlineExceeded/context canceled for device %s: %v - treating as empty transcript, keeping connection", sreq.Device, err)
+			// Don't close connection - let it be reused for next request
+			return "", nil // Return empty transcript, not error
+		}
 		safeLog("Xiaozhi STT: ERROR - Received error from errChan for device %s: %v (type: %T)", sreq.Device, err, err)
-		// Đóng connection nếu có lỗi
+		// Đóng connection nếu có lỗi thực sự
 		if deviceID != "" {
 			xiaozhi.CloseConnection(deviceID) // Đóng connection khi có lỗi
 		} else {

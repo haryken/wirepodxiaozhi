@@ -153,13 +153,30 @@ func StartReader(deviceID string, conn *websocket.Conn, sessionID string) {
 			messageType, message, err := conn.ReadMessage()
 			if err != nil {
 				// Error occurred - stop reader like go-xiaozhi-main
-				logger.Println(fmt.Sprintf("[ConnectionManager] Read error for device %s: %v, stopping reader", deviceID, err))
+				// Check if this is a graceful close (websocket: close 1005) during active LLM session
+				// If LLM is active and audio is playing, wait a bit before removing connection
+				// This gives time for audio to finish playing
+				connInfo.mu.RLock()
+				inUse := connInfo.InUse
+				llmHandler := connInfo.LLMHandler
+				connInfo.mu.RUnlock()
+				
+				// If connection is in use by LLM, wait longer before removing (audio might still be playing)
+				waitTime := 100 * time.Millisecond
+				if inUse && llmHandler != nil {
+					// LLM is active - wait longer to allow audio to finish
+					waitTime = 2 * time.Second
+					logger.Println(fmt.Sprintf("[ConnectionManager] Read error for device %s during active LLM session: %v, will wait %v before removing connection", deviceID, err, waitTime))
+				} else {
+					logger.Println(fmt.Sprintf("[ConnectionManager] Read error for device %s: %v, stopping reader", deviceID, err))
+				}
+				
 				connInfo.mu.Lock()
 				connInfo.ReaderRunning = false
 				connInfo.mu.Unlock()
-				// Remove connection from manager
+				// Remove connection from manager after wait time
 				go func() {
-					time.Sleep(100 * time.Millisecond)
+					time.Sleep(waitTime)
 					connManager.mu.Lock()
 					delete(connManager.connections, deviceID)
 					connManager.mu.Unlock()
@@ -410,6 +427,29 @@ func IsReaderRunning(deviceID string) bool {
 		return connInfo.ReaderRunning
 	}
 	return false
+}
+
+// CheckConnectionExists checks if a connection exists and is valid (regardless of in-use status)
+// This is used by STT to check if connection exists before deciding to wait or create new one
+func CheckConnectionExists(deviceID string) (*websocket.Conn, string, bool) {
+	connManager.mu.RLock()
+	defer connManager.mu.RUnlock()
+
+	connInfo, exists := connManager.connections[deviceID]
+	if !exists {
+		return nil, "", false
+	}
+
+	conn := connInfo.Conn
+	sessionID := connInfo.SessionID
+	readerRunning := connInfo.ReaderRunning
+
+	// Return connection if it exists, is valid, and reader is running (regardless of in-use status)
+	if conn != nil && IsConnectionValid(conn) && readerRunning {
+		return conn, sessionID, true
+	}
+
+	return nil, "", false
 }
 
 // RemoveConnection removes a connection for a device from the manager

@@ -719,14 +719,15 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 		}
 		safeLog("[Xiaozhi TTS] Device: %s | Opus decoder created, ready for real-time streaming", esn)
 
-		// Process OPUS chunks in real-time - same approach as /api-sdk/play_sound
-		// Accumulate chunks to 1024 bytes before sending (like /api-sdk/play_sound)
-		// But also send buffer if it's been waiting too long (>200ms) to avoid audio delay
-		chunkCount := 0                                      // Track total chunks sent (moved outside loop to prevent reset)
-		decodedFrameCount := 0                               // Track decoded frames for logging
-		accumulatedBuffer := []byte{}                        // Accumulate chunks until we have 1024 bytes
-		lastSendTime := time.Now()                           // Track when we last sent audio
-		flushTimer := time.NewTicker(200 * time.Millisecond) // Flush buffer every 200ms if not empty
+		// Process OPUS chunks in real-time - send immediately when audio is available
+		// Send audio as soon as we have any data (minimum 256 bytes for efficiency, but flush timer will send smaller chunks too)
+		// This ensures audio plays immediately without waiting for 1024 bytes
+		chunkCount := 0                                     // Track total chunks sent (moved outside loop to prevent reset)
+		decodedFrameCount := 0                              // Track decoded frames for logging
+		receivedChunkCount := 0                             // Track received chunks for logging
+		accumulatedBuffer := []byte{}                       // Accumulate chunks - send when >= 256 bytes or flush timer
+		lastSendTime := time.Now()                          // Track when we last sent audio
+		flushTimer := time.NewTicker(50 * time.Millisecond) // Flush buffer every 50ms if not empty (reduced from 200ms for faster response)
 		defer flushTimer.Stop()
 		for {
 			select {
@@ -832,7 +833,11 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 					continue
 				}
 
-				safeLog("[Xiaozhi TTS] Device: %s | ✅ Received audio chunk from handler: %d bytes", esn, len(chunk))
+				// Log received chunks (first and every 50th) to reduce log noise
+				receivedChunkCount++
+				if receivedChunkCount == 1 || receivedChunkCount%50 == 0 {
+					safeLog("[Xiaozhi TTS] Device: %s | ✅ Received chunk #%d: %d bytes", esn, receivedChunkCount, len(chunk))
+				}
 
 				// If vclient is nil (closed), continue receiving frames to avoid blocking handler
 				// but skip processing (decode, resample, send) since we can't send anymore
@@ -854,10 +859,10 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 					continue
 				}
 
-				// Log successful decode (first few frames and every 10th frame)
+				// Log successful decode (first frame and every 50th frame)
 				decodedFrameCount++
-				if decodedFrameCount == 1 || decodedFrameCount%10 == 0 {
-					safeLog("[Xiaozhi TTS] Device: %s | ✅ Opus decoded: %d samples (from %d bytes Opus frame, frame #%d)", esn, n, len(chunk), decodedFrameCount)
+				if decodedFrameCount == 1 || decodedFrameCount%50 == 0 {
+					safeLog("[Xiaozhi TTS] Device: %s | ✅ Opus decoded: %d samples (frame #%d)", esn, n, decodedFrameCount)
 				}
 
 				// Convert int16 → PCM bytes (little-endian) - use binary.LittleEndian for correct conversion
@@ -880,16 +885,15 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 					downsampledSize += len(c)
 				}
 
-				// Log buffer status (first few times and when buffer is growing)
-				if decodedFrameCount <= 5 || len(accumulatedBuffer) >= 1024 {
-					safeLog("[Xiaozhi TTS] Device: %s | 📊 Buffer status: accumulated=%d bytes (from %d bytes downsampled, %d chunks), ready to send: %v, vclient nil: %v", esn, len(accumulatedBuffer), downsampledSize, len(downsampledChunks), len(accumulatedBuffer) >= 1024, vclient == nil)
+				// Log buffer status (only first time and every 50th frame)
+				if decodedFrameCount == 1 || decodedFrameCount%50 == 0 {
+					safeLog("[Xiaozhi TTS] Device: %s | 📊 Buffer: %d bytes, ready: %v", esn, len(accumulatedBuffer), len(accumulatedBuffer) >= 256)
 				}
 
-				// Send 1024-byte chunks (like /api-sdk/play_sound)
-				// /api-sdk/play_sound only sends chunks >= 1024 bytes
-				// Keep sending until buffer is less than 1024 bytes
+				// Send audio chunks immediately when we have >= 256 bytes (reduced from 1024 for faster response)
+				// Keep sending until buffer is less than 256 bytes
 				sentInThisIteration := 0
-				for len(accumulatedBuffer) >= 1024 {
+				for len(accumulatedBuffer) >= 256 {
 					lastSendTime = time.Now() // Update last send time
 					if vclient == nil {
 						safeLog("[Xiaozhi TTS] Device: %s | ⚠️  vclient became nil during sending, stopping audio processing", esn)
@@ -901,8 +905,13 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 						return
 					}
 
-					chunkToSend := accumulatedBuffer[:1024]
-					accumulatedBuffer = accumulatedBuffer[1024:]
+					// Send up to 1024 bytes if available, otherwise send what we have (minimum 256 bytes)
+					chunkSize := 1024
+					if len(accumulatedBuffer) < 1024 {
+						chunkSize = len(accumulatedBuffer)
+					}
+					chunkToSend := accumulatedBuffer[:chunkSize]
+					accumulatedBuffer = accumulatedBuffer[chunkSize:]
 
 					// Double-check vclient is still valid before sending
 					if vclient == nil {
@@ -936,9 +945,9 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 					} else {
 						chunkCount++
 						sentInThisIteration++
-						// Always log first chunk and every 10th chunk to debug audio playback
-						if chunkCount == 1 || chunkCount%10 == 0 || sentInThisIteration > 0 {
-							safeLog("[Xiaozhi TTS] Device: %s | ✅ Sent audio chunk %d to robot (%d bytes), remaining buffer: %d bytes", esn, chunkCount, len(chunkToSend), len(accumulatedBuffer))
+						// Log first chunk and every 50th chunk to reduce log noise
+						if chunkCount == 1 || chunkCount%50 == 0 {
+							safeLog("[Xiaozhi TTS] Device: %s | ✅ Sent chunk %d (%d bytes), buffer: %d bytes", esn, chunkCount, len(chunkToSend), len(accumulatedBuffer))
 						}
 					}
 
@@ -946,14 +955,14 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 					time.Sleep(time.Millisecond * 60)
 				}
 			case <-flushTimer.C:
-				// Flush buffer if it's been waiting too long (>200ms) and has data
-				// This ensures audio is sent even if buffer < 1024 bytes, preventing audio delay
-				if len(accumulatedBuffer) > 0 && time.Since(lastSendTime) > 200*time.Millisecond {
+				// Flush buffer if it's been waiting too long (>50ms) and has data
+				// This ensures audio is sent immediately even if buffer < 256 bytes, preventing audio delay
+				if len(accumulatedBuffer) > 0 && time.Since(lastSendTime) > 50*time.Millisecond {
 					if vclient == nil {
 						safeLog("[Xiaozhi TTS] Device: %s | ⚠️  vclient is nil during flush, skipping", esn)
 						continue
 					}
-					// Send whatever we have (even if < 1024 bytes) to avoid delay
+					// Send whatever we have (even if < 256 bytes) to avoid delay
 					chunkToSend := accumulatedBuffer
 					accumulatedBuffer = []byte{} // Clear buffer
 					err := vclient.Send(&vectorpb.ExternalAudioStreamRequest{
@@ -974,7 +983,7 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 						}
 					} else {
 						chunkCount++
-						safeLog("[Xiaozhi TTS] Device: %s | ✅ Flushed audio chunk %d to robot (%d bytes) after 200ms timeout", esn, chunkCount, len(chunkToSend))
+						safeLog("[Xiaozhi TTS] Device: %s | ✅ Flushed audio chunk %d to robot (%d bytes) after 50ms timeout", esn, chunkCount, len(chunkToSend))
 						lastSendTime = time.Now()
 						time.Sleep(time.Millisecond * 60)
 					}
@@ -1060,8 +1069,10 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 				// Don't deactivate LLM handler or release connection immediately
 				// Keep handler active to receive any remaining messages from server
 				// This prevents server from closing connection prematurely
+				// IMPORTANT: Keep LLM handler active longer to prevent server from closing connection
+				// Server may close connection if it thinks client is done, so we keep handler active
 				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⏳ Waiting a bit more for server to send any remaining messages...", esn))
-				time.Sleep(2 * time.Second) // Wait longer to ensure server doesn't close connection
+				time.Sleep(5 * time.Second) // Wait longer (5s) to ensure server doesn't close connection during audio playback
 				// Deactivate LLM handler - connection manager's reader will route messages to STT handler
 				if deviceID != "" && connFromSTT {
 					llmHandler.SetActive(false)
@@ -1078,8 +1089,9 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 				// Wait a bit for WebSocket reader goroutine to process remaining messages
 				// Don't deactivate LLM handler or release connection immediately
 				// Keep handler active to receive any remaining messages from server
+				// IMPORTANT: Keep LLM handler active longer to prevent server from closing connection
 				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⏳ Waiting a bit more for server to send any remaining messages...", esn))
-				time.Sleep(2 * time.Second) // Wait longer to ensure server doesn't close connection
+				time.Sleep(5 * time.Second) // Wait longer (5s) to ensure server doesn't close connection during audio playback
 				// Deactivate LLM handler - connection manager's reader will route messages to STT handler
 				if deviceID != "" && connFromSTT {
 					llmHandler.SetActive(false)
