@@ -159,7 +159,7 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 
 	// Connect to xiaozhi WebSocket (using xiaozhi protocol)
 	// Increased timeout to 90 seconds to allow longer speech input
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second) // Increased to 120s for long speech
 	defer cancel()
 
 	// Lấy Device-Id và Client-Id từ config
@@ -625,7 +625,7 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 
 	// Step 4: Setup STT handler and channels for async communication
 	done := make(chan bool)
-	transcriptChan := make(chan string, 1)
+	transcriptChan := make(chan string, 10) // Increased buffer to 10 to handle long speech transcripts
 	errChan := make(chan error, 1)
 	errorOccurred := make(chan struct{}, 1)
 	connectionFailed := make(chan bool, 1)
@@ -1052,8 +1052,10 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 						listenStopSent = true // Đánh dấu đã gửi để tránh gửi lại
 					}
 
-					// Wait a bit for server to process
-					time.Sleep(500 * time.Millisecond)
+					// Wait longer for server to process long speech (increased from 500ms to 2s)
+					// This gives server more time to process long audio and send transcript
+					time.Sleep(2 * time.Second)
+					logger.Println(fmt.Sprintf("Xiaozhi STT: End of speech detected, waiting for transcript from server (after listen stop)"))
 
 					// KHÔNG đóng connection ở đây - LLM reader sẽ tiếp tục đọc từ connection này
 					// Chỉ dừng gửi audio chunks, nhưng tiếp tục đọc messages để LLM reader có thể xử lý
@@ -1077,7 +1079,8 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 	}()
 
 	// Step 7: Wait for transcript or error
-	safeLog("Xiaozhi STT: Waiting for transcript or error (timeout: 90s)")
+	// Increased timeout to 120s to handle long speech processing
+	safeLog("Xiaozhi STT: Waiting for transcript or error (timeout: 120s)")
 	select {
 	case transcript := <-transcriptChan:
 		safeLog("Xiaozhi STT: SUCCESS - Received transcript for device %s: %s", sreq.Device, transcript)
@@ -1142,8 +1145,8 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 		safeLog("Xiaozhi STT: ⚠️  Context canceled for device %s: %v - returning empty transcript, keeping connection", sreq.Device, ctx.Err())
 		// Don't close connection - let it be reused for next request
 		return "", nil // Return empty transcript, not error
-	case <-time.After(90 * time.Second):
-		safeLog("Xiaozhi STT: ERROR - Timeout waiting for transcript for device %s (90s)", sreq.Device)
+	case <-time.After(120 * time.Second):
+		safeLog("Xiaozhi STT: ERROR - Timeout waiting for transcript for device %s (120s)", sreq.Device)
 		// Đóng connection nếu timeout
 		if deviceID != "" {
 			xiaozhi.CloseConnection(deviceID) // Đóng connection khi timeout
