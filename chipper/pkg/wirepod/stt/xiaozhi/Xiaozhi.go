@@ -561,9 +561,11 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 	}
 
 	// Register STT handler with connection manager
+	// Ensure handler is active when registering (in case it was deactivated from previous request)
 	if deviceID != "" {
+		sttHandler.SetActive(true) // Ensure handler is active when registering
 		xiaozhi.SetSTTHandler(deviceID, sttHandler)
-		logger.Println(fmt.Sprintf("Xiaozhi STT: STT handler registered for device %s", deviceID))
+		logger.Println(fmt.Sprintf("Xiaozhi STT: STT handler registered for device %s (active: true)", deviceID))
 	}
 
 	// Step 5: Audio sending goroutine (no separate reader goroutine - using connection manager's reader)

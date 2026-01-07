@@ -14,6 +14,7 @@ import (
 type MessageHandler interface {
 	HandleMessage(messageType int, message []byte) error
 	IsActive() bool
+	SetActive(active bool)
 }
 
 // ConnectionInfo stores connection information and message handlers
@@ -209,9 +210,17 @@ func SetSTTHandler(deviceID string, handler MessageHandler) {
 
 	if connInfo, exists := connManager.connections[deviceID]; exists {
 		connInfo.mu.Lock()
+		// Clear old handler if exists
+		if connInfo.STTHandler != nil {
+			connInfo.STTHandler.SetActive(false)
+		}
+		// Set new handler and ensure it's active
 		connInfo.STTHandler = handler
+		if handler != nil {
+			handler.SetActive(true)
+		}
 		connInfo.mu.Unlock()
-		logger.Println(fmt.Sprintf("[ConnectionManager] STT handler set for device: %s", deviceID))
+		logger.Println(fmt.Sprintf("[ConnectionManager] STT handler set for device: %s (active: true)", deviceID))
 	}
 }
 
