@@ -547,11 +547,14 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 	// Log chi tiết listen start event (giống botkct.py để debug)
 	listenStartJSON, _ := json.Marshal(listenStart)
 	logger.Println(fmt.Sprintf("Xiaozhi STT: Sending listen start event: %s", string(listenStartJSON)))
-	// Use helper function with write mutex if reusing connection, otherwise direct write
+	// IMPORTANT: If connection will be stored (deviceID != ""), use direct write for listenStart
+	// because connection is not stored yet. After connection is stored, ALWAYS use xiaozhi.WriteJSON/WriteMessage
 	var err error
 	if connReused && deviceID != "" {
+		// Connection already stored, use helper with writeMu
 		err = xiaozhi.WriteJSON(deviceID, listenStart)
 	} else {
+		// New connection, not stored yet - use direct write (no concurrent writes yet)
 		err = conn.WriteJSON(listenStart)
 	}
 	if err != nil {
@@ -684,6 +687,9 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 			return "", fmt.Errorf("failed to store connection after all retries: %w", storeErr)
 		}
 		safeLog("Xiaozhi STT: Stored NEW connection for device %s (sessionID: %s) - reader goroutine started", deviceID, sessionID)
+		// IMPORTANT: After connection is stored, ping goroutine is running
+		// All subsequent writes MUST use xiaozhi.WriteMessage/WriteJSON to avoid concurrent write errors
+		connReused = true // Mark as "reused" so all writes use writeMu
 	}
 
 	// Register STT handler with connection manager
@@ -717,10 +723,13 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 				"mode":  "auto",
 			}
 			// go-xiaozhi-main KHÔNG gửi session_id trong listen stop message
-			// Use helper function with write mutex if reusing connection
-			if connReused && deviceID != "" {
+			// IMPORTANT: After connection is stored, ALWAYS use helper function with writeMu
+			// to avoid concurrent write errors (ping goroutine is running)
+			if deviceID != "" {
+				// Connection is stored, use helper with writeMu
 				xiaozhi.WriteJSON(deviceID, listenStop)
 			} else {
+				// No deviceID, connection not stored - use direct write (shouldn't happen in normal flow)
 				conn.WriteJSON(listenStop)
 			}
 		}()
@@ -789,10 +798,13 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 						// go-xiaozhi-main KHÔNG gửi session_id trong listen stop message
 						listenStopJSON, _ := json.Marshal(listenStop)
 						logger.Println(fmt.Sprintf("Xiaozhi STT: Sending listen stop event after EOF: %s", string(listenStopJSON)))
-						// Use helper function with write mutex if reusing connection
-						if connReused && deviceID != "" {
+						// IMPORTANT: After connection is stored, ALWAYS use helper function with writeMu
+						// to avoid concurrent write errors (ping goroutine is running)
+						if deviceID != "" {
+							// Connection is stored, use helper with writeMu
 							xiaozhi.WriteJSON(deviceID, listenStop)
 						} else {
+							// No deviceID, connection not stored - use direct write (shouldn't happen in normal flow)
 							conn.WriteJSON(listenStop)
 						}
 						// Use select with default to avoid blocking if no receiver
@@ -909,11 +921,14 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 									}
 									return
 								}
-								// Gửi OPUS frame - use helper function with write mutex if reusing connection
+								// IMPORTANT: After connection is stored, ALWAYS use helper function with writeMu
+								// to avoid concurrent write errors (ping goroutine is running)
 								var err error
-								if connReused && deviceID != "" {
+								if deviceID != "" {
+									// Connection is stored, use helper with writeMu
 									err = xiaozhi.WriteMessage(deviceID, websocket.BinaryMessage, opusFrame[:n])
 								} else {
+									// No deviceID, connection not stored - use direct write (shouldn't happen in normal flow)
 									err = conn.WriteMessage(websocket.BinaryMessage, opusFrame[:n])
 								}
 								if err != nil {
@@ -963,11 +978,14 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 							}
 							return
 						}
-						// Gửi audio chunk trực tiếp (có thể đã là raw OPUS) - use helper function with write mutex if reusing connection
+						// IMPORTANT: After connection is stored, ALWAYS use helper function with writeMu
+						// to avoid concurrent write errors (ping goroutine is running)
 						var err error
-						if connReused && deviceID != "" {
+						if deviceID != "" {
+							// Connection is stored, use helper with writeMu
 							err = xiaozhi.WriteMessage(deviceID, websocket.BinaryMessage, chunk)
 						} else {
+							// No deviceID, connection not stored - use direct write (shouldn't happen in normal flow)
 							err = conn.WriteMessage(websocket.BinaryMessage, chunk)
 						}
 						if err != nil {
@@ -1037,11 +1055,14 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 					// if sessionID != "" {
 					// 	listenStop["session_id"] = sessionID
 					// }
-					// Use helper function with write mutex if reusing connection
+					// IMPORTANT: After connection is stored, ALWAYS use helper function with writeMu
+					// to avoid concurrent write errors (ping goroutine is running)
 					var err error
-					if connReused && deviceID != "" {
+					if deviceID != "" {
+						// Connection is stored, use helper with writeMu
 						err = xiaozhi.WriteJSON(deviceID, listenStop)
 					} else {
+						// No deviceID, connection not stored - use direct write (shouldn't happen in normal flow)
 						err = conn.WriteJSON(listenStop)
 					}
 					if err != nil {

@@ -254,6 +254,28 @@ func SetLLMHandler(deviceID string, handler MessageHandler) {
 	}
 }
 
+// ActivateSTTHandler activates the existing STT handler for a device
+// This is useful when reusing connection and need to reactivate handler
+func ActivateSTTHandler(deviceID string) bool {
+	connManager.mu.Lock()
+	defer connManager.mu.Unlock()
+
+	if connInfo, exists := connManager.connections[deviceID]; exists {
+		connInfo.mu.Lock()
+		if connInfo.STTHandler != nil {
+			connInfo.STTHandler.SetActive(true)
+			connInfo.mu.Unlock()
+			logger.Println(fmt.Sprintf("[ConnectionManager] STT handler activated for device: %s", deviceID))
+			return true
+		}
+		connInfo.mu.Unlock()
+		logger.Println(fmt.Sprintf("[ConnectionManager] No STT handler found for device: %s", deviceID))
+		return false
+	}
+	logger.Println(fmt.Sprintf("[ConnectionManager] No connection found for device: %s", deviceID))
+	return false
+}
+
 // StoreConnection stores a WebSocket connection for a device
 // This is called by STT after establishing connection
 // Starts the single reader goroutine (like go-xiaozhi-main)

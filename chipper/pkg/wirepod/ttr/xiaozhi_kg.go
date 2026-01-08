@@ -639,6 +639,18 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 	// Note: xiaozhi expects audio input, so we need to handle text differently
 	// For now, we'll just wait for response
 
+	// Calculate shouldContinueConversation BEFORE starting audio processing goroutine
+	// This allows us to trigger DoNewRequest immediately after AudioStreamComplete
+	// NOTE: We'll update this when we receive the text response (to check for {{newVoiceRequest||now}})
+	shouldContinueConversation := false
+	if vars.APIConfig.Knowledge.SaveChat {
+		shouldContinueConversation = true
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ SaveChat enabled - continuous conversation will be activated after audio", esn))
+	} else if isConversationMode {
+		shouldContinueConversation = true
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Conversation mode explicitly requested - continuous conversation will be activated after audio", esn))
+	}
+
 	// Play audio chunks to robot
 	// Audio from xiaozhi is Opus-encoded at 24kHz
 	// We need to: Decode Opus → PCM → Downsample 24k→16k → Send to robot
@@ -768,6 +780,33 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 						safeLog("[Xiaozhi TTS] Device: %s | ⚠️  ERROR - Failed to send AudioStreamComplete: %v", esn, err)
 					} else {
 						safeLog("[Xiaozhi TTS] Device: %s | ✅ Audio stream complete sent to robot (total chunks sent: %d)", esn, chunkCount)
+
+						// CRITICAL: Trigger DoNewRequest IMMEDIATELY after AudioStreamComplete
+						// Robot is now idle and ready to accept AppIntent
+						if shouldContinueConversation && robot != nil {
+							safeLog("[Xiaozhi TTS] Device: %s | 🎤 Triggering continuous listening IMMEDIATELY after AudioStreamComplete...", esn)
+							go func() {
+								// Activate STT handler BEFORE calling DoNewRequest
+								if vars.APIConfig.Knowledge.Provider == "xiaozhi" && deviceID != "" {
+									if activated := xiaozhi.ActivateSTTHandler(deviceID); activated {
+										safeLog("[Xiaozhi TTS] Device: %s | ✅ STT handler activated", esn)
+									}
+									// Send listen start message to xiaozhi server
+									listenStart := map[string]interface{}{
+										"type":  "listen",
+										"state": "start",
+										"mode":  "auto",
+									}
+									if err := xiaozhi.WriteJSON(deviceID, listenStart); err == nil {
+										safeLog("[Xiaozhi TTS] Device: %s | ✅ Listen start message sent to xiaozhi server", esn)
+									}
+								}
+								// Call DoNewRequest immediately - robot is already idle
+								safeLog("[Xiaozhi TTS] Device: %s | 📞 Calling DoNewRequest() immediately after AudioStreamComplete...", esn)
+								DoNewRequest(robot)
+								safeLog("[Xiaozhi TTS] Device: %s | ✅ Continuous listening triggered", esn)
+							}()
+						}
 					}
 				} else {
 					safeLog("[Xiaozhi TTS] Device: %s | ⚠️  vclient is nil, cannot send AudioStreamComplete", esn)
@@ -816,6 +855,33 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 							safeLog("[Xiaozhi TTS] Device: %s | ⚠️  ERROR - Failed to send AudioStreamComplete: %v", esn, err)
 						} else {
 							safeLog("[Xiaozhi TTS] Device: %s | ✅ Audio stream complete sent to robot (total chunks sent: %d)", esn, chunkCount)
+
+							// CRITICAL: Trigger DoNewRequest IMMEDIATELY after AudioStreamComplete
+							// Robot is now idle and ready to accept AppIntent
+							if shouldContinueConversation && robot != nil {
+								safeLog("[Xiaozhi TTS] Device: %s | 🎤 Triggering continuous listening IMMEDIATELY after AudioStreamComplete...", esn)
+								go func() {
+									// Activate STT handler BEFORE calling DoNewRequest
+									if vars.APIConfig.Knowledge.Provider == "xiaozhi" && deviceID != "" {
+										if activated := xiaozhi.ActivateSTTHandler(deviceID); activated {
+											safeLog("[Xiaozhi TTS] Device: %s | ✅ STT handler activated", esn)
+										}
+										// Send listen start message to xiaozhi server
+										listenStart := map[string]interface{}{
+											"type":  "listen",
+											"state": "start",
+											"mode":  "auto",
+										}
+										if err := xiaozhi.WriteJSON(deviceID, listenStart); err == nil {
+											safeLog("[Xiaozhi TTS] Device: %s | ✅ Listen start message sent to xiaozhi server", esn)
+										}
+									}
+									// Call DoNewRequest immediately - robot is already idle
+									safeLog("[Xiaozhi TTS] Device: %s | 📞 Calling DoNewRequest() immediately after AudioStreamComplete...", esn)
+									DoNewRequest(robot)
+									safeLog("[Xiaozhi TTS] Device: %s | ✅ Continuous listening triggered", esn)
+								}()
+							}
 						}
 					} else {
 						safeLog("[Xiaozhi TTS] Device: %s | ⚠️  vclient is nil, cannot send AudioStreamComplete", esn)
@@ -1125,20 +1191,9 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 			}
 		}
 
-		// Check if conversation should continue (newVoiceRequest action)
-		// If conversation mode is enabled (either via SaveChat or explicit request), trigger continuous listening
-		shouldContinueConversation := (vars.APIConfig.Knowledge.SaveChat || isConversationMode) && strings.Contains(text, "{{newVoiceRequest||now}}")
-		if shouldContinueConversation && robot != nil {
-			logger.Println("Xiaozhi KG: Continuous conversation mode activated - robot will listen for next question")
-			// Trigger robot to listen for next question without wake word
-			// This happens after audio playback completes
-			go func() {
-				time.Sleep(1 * time.Second) // Wait a bit more for audio to finish
-				DoNewRequest(robot)
-			}()
-		} else if shouldContinueConversation && robot == nil {
-			logger.Println(fmt.Sprintf("Xiaozhi KG: Continuous conversation mode requested but robot %s not available", esn))
-		}
+		// NOTE: Continuous conversation is now triggered IMMEDIATELY after AudioStreamComplete
+		// in the audio processing goroutine (see line ~770 and ~820)
+		// This ensures DoNewRequest is called as soon as robot finishes speaking
 
 		// Wait a bit for audio processing to complete before returning
 		// This ensures audioCtx is not canceled too early, allowing audio chunks to be sent

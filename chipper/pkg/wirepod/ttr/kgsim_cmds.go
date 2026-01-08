@@ -621,8 +621,55 @@ func DoGetImage(msgs []openai.ChatCompletionMessage, param string, robot *vector
 }
 
 func DoNewRequest(robot *vector.Vector) {
-	time.Sleep(time.Second / 3)
-	robot.Conn.AppIntent(context.Background(), &vectorpb.AppIntentRequest{Intent: "knowledge_question"})
+	esn := robot.Cfg.SerialNo
+	logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] Triggering continuous listening...", esn))
+
+	// IMPORTANT: This is called IMMEDIATELY after AudioStreamComplete
+	// Robot should already be idle, but we need a very short delay for robot to process
+	// Reduced delay since we're calling immediately after AudioStreamComplete
+	logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ⏳ Very short delay to ensure robot processed AudioStreamComplete (300ms)...", esn))
+	time.Sleep(300 * time.Millisecond) // Very short delay - robot should already be idle
+
+	// Retry logic: Try AppIntent up to 3 times with delays
+	maxRetries := 3
+	retryDelay := 500 * time.Millisecond
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] 📞 Attempt %d/%d: Sending AppIntent(knowledge_question) to robot...", esn, attempt, maxRetries))
+
+		// Send AppIntent to trigger robot to enter knowledge_question mode
+		// This makes robot listen for next question without wake word
+		appIntentCtx, appIntentCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		resp, err := robot.Conn.AppIntent(appIntentCtx, &vectorpb.AppIntentRequest{Intent: "knowledge_question"})
+		appIntentCancel()
+
+		if err != nil {
+			lastErr = err
+			logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ❌ ERROR - Attempt %d/%d failed: %v", esn, attempt, maxRetries, err))
+			if attempt < maxRetries {
+				logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ⏳ Retrying in %v...", esn, retryDelay))
+				time.Sleep(retryDelay)
+			}
+		} else {
+			// Log response details for debugging
+			if resp != nil {
+				logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ✅ AppIntent response received: %+v", esn, resp))
+			} else {
+				logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ✅ AppIntent sent successfully (no response data)", esn))
+			}
+			logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ✅ AppIntent(knowledge_question) sent successfully (attempt %d/%d) - robot should now be listening for next question", esn, attempt, maxRetries))
+			// Additional delay after successful AppIntent to allow robot to process and open mic
+			logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ⏳ Waiting for robot to process AppIntent and open mic (500ms)...", esn))
+			time.Sleep(500 * time.Millisecond)
+			logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ✅ Robot should now be listening - mic should be open", esn))
+			return // Success, exit function
+		}
+	}
+
+	// All retries failed
+	logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ❌ ERROR - Failed to send AppIntent after %d attempts: %v", esn, maxRetries, lastErr))
+	logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ⚠️  Robot may not be ready or connection issue - continuous listening may not work", esn))
 }
 
 func PerformActions(msgs []openai.ChatCompletionMessage, actions []RobotAction, robot *vector.Vector, stopStop chan bool) bool {
