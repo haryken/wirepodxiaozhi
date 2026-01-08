@@ -695,7 +695,7 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 	errChan := make(chan error, 1)
 	ttsStopChan := make(chan bool, 1) // Signal when TTS stops (for connection release timing)
 
-	// Create LLM handler instance (vclient and opusDecoder will be set after audio client is created)
+	// Create LLM handler instance (vclient and opusDecoder will be set BEFORE registering handler)
 	llmHandler := &LLMHandler{
 		textResponse:            textResponse,
 		errChan:                 errChan,
@@ -708,13 +708,9 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 		audioQueueStarted:       false,
 	}
 
-	// Register LLM handler with connection manager (always register, whether connection from STT or newly created)
-	if deviceID != "" {
-		xiaozhi.SetLLMHandler(deviceID, llmHandler)
-		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | LLM handler registered for device %s (connFromSTT: %v)", esn, deviceID, connFromSTT))
-	}
-
-	// Setup audio playback client (only if robot connection exists)
+	// Setup audio playback client FIRST (only if robot connection exists)
+	// IMPORTANT: Setup audio BEFORE registering LLM handler to avoid race condition
+	// where audio frames arrive before opusDecoder is set
 	// Use the same pattern as kgsim_cmds.go - let Go infer the type
 	var vclient interface {
 		Send(*vectorpb.ExternalAudioStreamRequest) error
@@ -767,6 +763,7 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 	}
 
 	// Setup audio processing in LLM handler (synchronous processing)
+	// IMPORTANT: Do this BEFORE registering LLM handler to avoid race condition
 	if vclient != nil && audioPrepareSent {
 		// Create Opus decoder for 24kHz, mono
 		opusDecoder, err := opus.NewDecoder(24000, 1)
@@ -774,7 +771,8 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Failed to create Opus decoder: %v. Disabling audio playback.", esn, err))
 			vclient = nil
 		} else {
-			// Set vclient and opusDecoder in LLM handler for synchronous processing
+			// Set vclient and opusDecoder in LLM handler BEFORE registering handler
+			// This ensures opusDecoder is ready when first audio frame arrives
 			llmHandler.mu.Lock()
 			llmHandler.vclient = vclient
 			llmHandler.opusDecoder = opusDecoder
@@ -844,6 +842,13 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 				}
 			}()
 		}
+	}
+
+	// Register LLM handler with connection manager AFTER audio setup is complete
+	// This ensures opusDecoder is ready when first audio frame arrives
+	if deviceID != "" {
+		xiaozhi.SetLLMHandler(deviceID, llmHandler)
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | LLM handler registered for device %s (connFromSTT: %v, audio ready: %v)", esn, deviceID, connFromSTT, vclient != nil && audioPrepareSent))
 	}
 
 	// No separate reader goroutine - using connection manager's reader
@@ -916,6 +921,15 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Connection ready for STT handler (connection always available, routing handles it)", esn))
 		}
 
+		// Debug: Log conditions for DoNewRequest
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | 🔍 DoNewRequest conditions: shouldContinueConversation=%v, robot!=nil=%v", esn, shouldContinueConversation, robot != nil))
+		if !shouldContinueConversation {
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  DoNewRequest skipped: shouldContinueConversation=false (SaveChat=%v, isConversationMode=%v)", esn, vars.APIConfig.Knowledge.SaveChat, isConversationMode))
+		}
+		if robot == nil {
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  DoNewRequest skipped: robot is nil", esn))
+		}
+
 		// Trigger DoNewRequest if continuous conversation is enabled
 		if shouldContinueConversation && robot != nil {
 			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | 🎤 Starting continuous listening trigger...", esn))
@@ -962,6 +976,28 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | 📞 Attempt %d/%d: Calling DoNewRequest()...", esn, attempt, maxAttempts))
 				DoNewRequest(robot)
 				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ DoNewRequest() called (attempt %d/%d)", esn, attempt, maxAttempts))
+
+				// Say "a" to prevent default noise sound
+				// IMPORTANT: Add small delay after DoNewRequest to ensure robot processed it
+				time.Sleep(200 * time.Millisecond)
+				if robot != nil && robot.Conn != nil {
+					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | 🔊 Calling SayText('a') after DoNewRequest()...", esn))
+					_, err := robot.Conn.SayText(
+						context.Background(),
+						&vectorpb.SayTextRequest{
+							Text:           "a",
+							UseVectorVoice: true,
+							DurationScalar: 0.95,
+						},
+					)
+					if err != nil {
+						logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  ERROR - Failed to call SayText('a'): %v", esn, err))
+					} else {
+						logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ SayText('a') called successfully after DoNewRequest() to prevent default noise", esn))
+					}
+				} else {
+					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Cannot call SayText('a'): robot=%v, robot.Conn=%v", esn, robot != nil, robot != nil && robot.Conn != nil))
+				}
 
 				// Wait and check if robot is listening
 				time.Sleep(500 * time.Millisecond)
