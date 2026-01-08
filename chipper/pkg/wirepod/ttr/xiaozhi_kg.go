@@ -33,14 +33,15 @@ var audioQueueMutex sync.Mutex
 // LLMHandler implements MessageHandler interface for LLM
 // This handler processes LLM/TTS-related messages from the single reader goroutine
 type LLMHandler struct {
-	textResponse    chan string
-	errChan         chan error
-	ttsStopChan     chan bool
-	active          bool
-	audioChunkCount int
-	ttsStopped      bool      // Flag to indicate TTS has stopped
-	lastFrameTime   time.Time // Track when last audio frame was received
-	mu              sync.RWMutex
+	textResponse            chan string
+	errChan                 chan error
+	ttsStopChan             chan bool
+	audioStreamCompleteChan chan bool // Signal when AudioStreamComplete has been sent
+	active                  bool
+	audioChunkCount         int
+	ttsStopped              bool      // Flag to indicate TTS has stopped
+	lastFrameTime           time.Time // Track when last audio frame was received
+	mu                      sync.RWMutex
 	// Audio processing (synchronous)
 	vclient interface {
 		Send(*vectorpb.ExternalAudioStreamRequest) error
@@ -204,6 +205,13 @@ func (h *LLMHandler) HandleMessage(messageType int, message []byte) error {
 							h.mu.Lock()
 							h.accumulatedBuffer = []byte{}
 							h.mu.Unlock()
+							// IMPORTANT: Signal that AudioStreamComplete has been sent
+							// This allows DoNewRequest to proceed safely (vclient won't be closed)
+							select {
+							case h.audioStreamCompleteChan <- true:
+								logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ✅ AudioStreamComplete signal sent"))
+							default:
+							}
 							// IMPORTANT: Wait longer after AudioStreamComplete to ensure robot starts playing audio
 							// Robot needs time to process all chunks and start playback
 							time.Sleep(1 * time.Second)
@@ -675,14 +683,15 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 
 	// Create LLM handler instance (vclient and opusDecoder will be set after audio client is created)
 	llmHandler := &LLMHandler{
-		textResponse:      textResponse,
-		errChan:           errChan,
-		ttsStopChan:       ttsStopChan,
-		active:            true,
-		audioChunkCount:   0,
-		accumulatedBuffer: []byte{},
-		chunkCount:        0,
-		audioQueueStarted: false,
+		textResponse:            textResponse,
+		errChan:                 errChan,
+		ttsStopChan:             ttsStopChan,
+		audioStreamCompleteChan: make(chan bool, 1), // Signal when AudioStreamComplete has been sent
+		active:                  true,
+		audioChunkCount:         0,
+		accumulatedBuffer:       []byte{},
+		chunkCount:              0,
+		audioQueueStarted:       false,
 	}
 
 	// Register LLM handler with connection manager (always register, whether connection from STT or newly created)
@@ -855,45 +864,32 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 		defer audioCancelSafe()    // Cancel audio context when done
 		defer StopAudio_Queue(esn) // Mark audio as finished when done
 
-		// Wait for TTS stop event
+		// IMPORTANT: Đợi TTS stop event - KHÔNG timeout và tiếp tục nếu TTS vẫn đang tiếp tục
+		// Chỉ gọi DoNewRequest khi TTS thực sự dừng (nhận được TTS stop event từ server)
+		// Điều này đảm bảo robot không bị dừng audio playback giữa chừng
 		select {
 		case <-ttsStopChan:
-			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ TTS stop event received, preparing for continuous conversation...", esn))
-		case <-time.After(30 * time.Second):
-			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⏱️  Timeout waiting for TTS stop (30s), proceeding anyway", esn))
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ TTS stop event received (robot dừng nói), waiting for AudioStreamComplete...", esn))
+		case <-time.After(120 * time.Second):
+			// Timeout dài hơn (120s) để đợi TTS dài, nhưng vẫn log warning
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Timeout waiting for TTS stop (120s), TTS may still be in progress. NOT calling DoNewRequest to avoid interrupting audio.", esn))
+			// KHÔNG tiếp tục - return để tránh interrupt audio playback
+			return
 		}
 
-		// IMPORTANT: Wait for LLM handler to finish sending AudioStreamComplete AND robot to start playing audio
-		// LLM handler needs time to:
-		// 1. Sleep 1 second after TTS stop (wait for remaining frames)
-		// 2. Send final buffer (if any)
-		// 3. Send AudioStreamComplete
-		// 4. Wait 500ms after AudioStreamComplete (for robot to start playing)
-		// Total time needed: ~2-3 seconds
-		// Then wait additional time for robot to finish playing audio (estimate based on chunks sent)
-		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⏳ Waiting for LLM handler to finish sending AudioStreamComplete and robot to start playing...", esn))
-		time.Sleep(3 * time.Second) // Wait for LLM handler to complete audio sending and robot to start
-
-		// Estimate audio duration: each chunk is ~60ms, wait for estimated playback time
-		// Get chunk count to estimate duration
-		llmHandler.mu.RLock()
-		estimatedChunks := llmHandler.chunkCount
-		llmHandler.mu.RUnlock()
-		if estimatedChunks > 0 {
-			// Estimate: each chunk ~60ms, add 2 seconds buffer for safety
-			estimatedDuration := time.Duration(estimatedChunks) * 60 * time.Millisecond
-			estimatedDuration += 2 * time.Second // Safety buffer
-			if estimatedDuration > 3*time.Second {
-				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⏳ Estimated audio duration: %v, waiting for robot to finish playing...", esn, estimatedDuration))
-				time.Sleep(estimatedDuration - 3*time.Second) // Already waited 3 seconds above
-			}
+		// IMPORTANT: Đợi AudioStreamComplete được gửi TRƯỚC khi gọi DoNewRequest
+		// Điều này đảm bảo vclient không bị đóng khi DoNewRequest được gọi
+		// Flow: TTS stop → Wait for AudioStreamComplete → Deactivate LLM → Activate STT → DoNewRequest
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⏳ Waiting for AudioStreamComplete to be sent...", esn))
+		select {
+		case <-llmHandler.audioStreamCompleteChan:
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ AudioStreamComplete confirmed sent, safe to call DoNewRequest", esn))
+		case <-time.After(10 * time.Second):
+			// Timeout dài hơn (10s) để đợi AudioStreamComplete
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Timeout waiting for AudioStreamComplete (10s), proceeding anyway (may cause issues)", esn))
 		}
-
-		// IMPORTANT: Release connection after LLM handler finishes (before DoNewRequest)
-		// This allows STT handler to use the connection as soon as robot starts speaking
-		// Flow: TTS stop → Wait for AudioStreamComplete → Release connection → Activate STT → DoNewRequest → Robot speaks → STT uses connection
 		if shouldContinueConversation && connFromSTT && deviceID != "" {
-			// Deactivate LLM handler - connection manager's reader will route messages to STT handler
+			// Deactivate LLM handler NGAY LẬP TỨC - connection manager's reader will route messages to STT handler
 			// (giống botkct.py - không cần "release connection", chỉ cần deactivate handler)
 			llmHandler.SetActive(false)
 			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ LLM handler deactivated (connection manager will route to STT handler)", esn))
@@ -924,8 +920,8 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 				}
 			}
 
-			// Call DoNewRequest 2 times with shorter delay between attempts
-			maxAttempts := 2
+			// Call DoNewRequest 3 times with shorter delay between attempts
+			maxAttempts := 3
 			attemptInterval := 500 * time.Millisecond
 			timeout := 10 * time.Second
 			timeoutChan := time.After(timeout)

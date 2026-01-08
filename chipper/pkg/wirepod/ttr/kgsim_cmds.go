@@ -629,9 +629,9 @@ func DoNewRequest(robot *vector.Vector) {
 	logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ⏳ Delay to ensure robot processed AudioStreamComplete and is idle (500ms)...", esn))
 	time.Sleep(500 * time.Millisecond) // Reduced delay for faster retry
 
-	// Retry logic: Try AppIntent up to 5 times with shorter delays (faster retry)
+	// Retry logic: Try AppIntent up to 3 times with shorter delays (faster retry)
 	// IMPORTANT: Send AppIntent multiple times even when successful to ensure robot opens mic
-	maxRetries := 5
+	maxRetries := 3
 	retryDelay := 300 * time.Millisecond // Reduced from 500ms to 300ms for faster retry
 	var lastErr error
 	successCount := 0
@@ -676,9 +676,15 @@ func DoNewRequest(robot *vector.Vector) {
 		}
 	}
 
-	// All retries failed
-	logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ❌ ERROR - Failed to send AppIntent after %d attempts: %v", esn, maxRetries, lastErr))
-	logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ⚠️  Robot may not be ready or connection issue - continuous listening may not work", esn))
+	// Check if all retries failed
+	if successCount == 0 {
+		// All retries failed
+		logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ❌ ERROR - Failed to send AppIntent after %d attempts: %v", esn, maxRetries, lastErr))
+		logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ⚠️  Robot may not be ready or connection issue - continuous listening may not work", esn))
+	} else {
+		// At least one attempt succeeded
+		logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ✅ Successfully sent AppIntent (%d/%d attempts succeeded)", esn, successCount, maxRetries))
+	}
 }
 
 func PerformActions(msgs []openai.ChatCompletionMessage, actions []RobotAction, robot *vector.Vector, stopStop chan bool) bool {
