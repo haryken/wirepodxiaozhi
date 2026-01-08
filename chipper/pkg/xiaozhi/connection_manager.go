@@ -19,16 +19,16 @@ type MessageHandler interface {
 
 // ConnectionInfo stores connection information and message handlers
 type ConnectionInfo struct {
-	Conn              *websocket.Conn
-	SessionID         string
-	InUse             bool
-	STTHandler        MessageHandler
-	LLMHandler        MessageHandler
-	ReaderRunning     bool
-	ReaderStop        chan struct{}
-	LastAudioChunkTime time.Time // Track when last audio chunk was received from robot (indicates robot is listening)
-	mu                sync.RWMutex // For reading ConnectionInfo fields
-	writeMu           sync.Mutex   // For serializing writes to WebSocket connection (WebSocket is not thread-safe for concurrent writes)
+	Conn               *websocket.Conn
+	SessionID          string
+	InUse              bool
+	STTHandler         MessageHandler
+	LLMHandler         MessageHandler
+	ReaderRunning      bool
+	ReaderStop         chan struct{}
+	LastAudioChunkTime time.Time    // Track when last audio chunk was received from robot (indicates robot is listening)
+	mu                 sync.RWMutex // For reading ConnectionInfo fields
+	writeMu            sync.Mutex   // For serializing writes to WebSocket connection (WebSocket is not thread-safe for concurrent writes)
 }
 
 // ConnectionManager manages WebSocket connections per device
@@ -155,29 +155,37 @@ func StartReader(deviceID string, conn *websocket.Conn, sessionID string) {
 			if err != nil {
 				// Error occurred - stop reader like go-xiaozhi-main
 				// Check if this is a graceful close (websocket: close 1005) during active LLM session
-				// If LLM is active and audio is playing, wait a bit before removing connection
-				// This gives time for audio to finish playing
 				connInfo.mu.RLock()
-				inUse := connInfo.InUse
 				llmHandler := connInfo.LLMHandler
+				sttHandler := connInfo.STTHandler
 				connInfo.mu.RUnlock()
-				
-				// If connection is in use by LLM, wait longer before removing (audio might still be playing)
-				waitTime := 100 * time.Millisecond
-				if inUse && llmHandler != nil {
-					// LLM is active - wait longer to allow audio to finish
-					waitTime = 2 * time.Second
-					logger.Println(fmt.Sprintf("[ConnectionManager] Read error for device %s during active LLM session: %v, will wait %v before removing connection", deviceID, err, waitTime))
-				} else {
-					logger.Println(fmt.Sprintf("[ConnectionManager] Read error for device %s: %v, stopping reader", deviceID, err))
+
+				// IMPORTANT: Deactivate handlers and release connection when connection is closed
+				// This allows STT to create new connection and reuse session
+				if llmHandler != nil {
+					llmHandler.SetActive(false)
+					logger.Println(fmt.Sprintf("[ConnectionManager] LLM handler deactivated due to connection close for device %s", deviceID))
 				}
-				
+				if sttHandler != nil {
+					sttHandler.SetActive(false)
+					logger.Println(fmt.Sprintf("[ConnectionManager] STT handler deactivated due to connection close for device %s", deviceID))
+				}
+
+				// IMPORTANT: Mark connection as invalid IMMEDIATELY by setting Conn to nil
+				// This prevents STT handler from trying to reuse a closed connection
+				// (giống botkct.py - không cần "in use" flag, chỉ cần mark invalid)
 				connInfo.mu.Lock()
 				connInfo.ReaderRunning = false
+				connInfo.Conn = nil // Mark as invalid immediately
 				connInfo.mu.Unlock()
-				// Remove connection from manager after wait time
+
+				logger.Println(fmt.Sprintf("[ConnectionManager] Read error for device %s: %v, connection marked as invalid immediately", deviceID, err))
+
+				// Remove connection from manager immediately (no wait)
+				// STT handler will create new connection when needed
 				go func() {
-					time.Sleep(waitTime)
+					// Small delay to ensure all cleanup is done
+					time.Sleep(100 * time.Millisecond)
 					connManager.mu.Lock()
 					delete(connManager.connections, deviceID)
 					connManager.mu.Unlock()
@@ -186,22 +194,23 @@ func StartReader(deviceID string, conn *websocket.Conn, sessionID string) {
 				return
 			}
 
-			// Route message to appropriate handler
+			// Route message to appropriate handler (giống botkct.py - đơn giản, không cần "in use" flag)
+			// Priority: LLM handler (if active) > STT handler (if active)
+			// This matches botkct.py behavior: same connection, routing based on handler state
 			connInfo.mu.RLock()
 			sttHandler := connInfo.STTHandler
 			llmHandler := connInfo.LLMHandler
-			inUse := connInfo.InUse
 			connInfo.mu.RUnlock()
 
-			// Route to LLM handler if active and in use
-			if inUse && llmHandler != nil && llmHandler.IsActive() {
+			// Route to LLM handler if active (priority - LLM is processing response)
+			if llmHandler != nil && llmHandler.IsActive() {
 				if err := llmHandler.HandleMessage(messageType, message); err != nil {
 					logger.Println(fmt.Sprintf("[ConnectionManager] LLM handler error for device %s: %v", deviceID, err))
 				}
 				continue
 			}
 
-			// Route to STT handler if active
+			// Route to STT handler if active (fallback - STT is listening)
 			if sttHandler != nil && sttHandler.IsActive() {
 				if err := sttHandler.HandleMessage(messageType, message); err != nil {
 					logger.Println(fmt.Sprintf("[ConnectionManager] STT handler error for device %s: %v", deviceID, err))
@@ -339,23 +348,17 @@ func StoreConnection(deviceID string, conn *websocket.Conn, sessionID string) er
 	connManager.mu.Lock()
 	defer connManager.mu.Unlock()
 
-	// Close old connection if exists, BUT NOT if it's currently in use by LLM
+	// Close old connection if exists (giống botkct.py - đơn giản, không check "in use")
+	// If LLM handler is active, it will be deactivated when connection closes
 	if oldConnInfo, exists := connManager.connections[deviceID]; exists && oldConnInfo.Conn != nil {
-		// Check if old connection is in use
-		oldConnInfo.mu.RLock()
-		inUse := oldConnInfo.InUse
-		oldConnInfo.mu.RUnlock()
-		
-		if inUse {
-			// Old connection is in use by LLM, don't close it
-			// This prevents interrupting LLM audio playback
-			logger.Println(fmt.Sprintf("[ConnectionManager] ⚠️  Old connection for device %s is IN USE by LLM, cannot replace it. New connection will not be stored.", deviceID))
-			// Close the new connection since we can't use it
-			conn.Close()
-			return fmt.Errorf("connection for device %s is in use by LLM, cannot store new connection", deviceID)
-		}
-		
 		logger.Println(fmt.Sprintf("[ConnectionManager] Closing old connection for device: %s", deviceID))
+		// Deactivate handlers before closing
+		if oldConnInfo.LLMHandler != nil {
+			oldConnInfo.LLMHandler.SetActive(false)
+		}
+		if oldConnInfo.STTHandler != nil {
+			oldConnInfo.STTHandler.SetActive(false)
+		}
 		// Stop old reader
 		if oldConnInfo.ReaderRunning {
 			select {
@@ -395,11 +398,11 @@ func IsConnectionValid(conn *websocket.Conn) bool {
 }
 
 // GetConnection retrieves a WebSocket connection for a device
-// Returns connection, sessionID, and whether connection exists and is valid
-// NOTE: This marks the connection as "in use" - caller should call ReleaseConnection when done
+// SIMPLIFIED: No "in use" flag (giống botkct.py - connection luôn available)
+// Connection can be used by multiple handlers simultaneously (routing handles it)
 func GetConnection(deviceID string) (*websocket.Conn, string, bool) {
-	connManager.mu.Lock()
-	defer connManager.mu.Unlock()
+	connManager.mu.RLock()
+	defer connManager.mu.RUnlock()
 
 	connInfo, exists := connManager.connections[deviceID]
 	if !exists {
@@ -408,38 +411,28 @@ func GetConnection(deviceID string) (*websocket.Conn, string, bool) {
 
 	conn := connInfo.Conn
 	sessionID := connInfo.SessionID
-	inUse := connInfo.InUse
 
-	// Check if connection exists, is still valid, and NOT currently in use
-	if exists && IsConnectionValid(conn) && !inUse {
-		// Mark as in use
-		connInfo.InUse = true
-		logger.Println(fmt.Sprintf("[ConnectionManager] Connection for device %s marked as IN USE", deviceID))
+	// Check if connection exists and is still valid (giống botkct.py - đơn giản)
+	if exists && conn != nil && IsConnectionValid(conn) && connInfo.ReaderRunning {
+		logger.Println(fmt.Sprintf("[ConnectionManager] Connection for device %s available (sessionID: %s)", deviceID, sessionID))
 		return conn, sessionID, true
 	}
 
-	// Connection exists but is invalid or in use
+	// Connection exists but is invalid
 	if exists && conn != nil {
-		if inUse {
-			logger.Println(fmt.Sprintf("[ConnectionManager] Connection for device %s exists but is IN USE by another request, cannot reuse", deviceID))
-		} else {
-			logger.Println(fmt.Sprintf("[ConnectionManager] Connection for device %s exists but is invalid, will be removed", deviceID))
-		}
+		logger.Println(fmt.Sprintf("[ConnectionManager] Connection for device %s exists but is invalid", deviceID))
 	}
 
 	return nil, "", false
 }
 
-// ReleaseConnection marks a connection as no longer in use
-// This should be called when LLM finishes using the connection
+// ReleaseConnection - SIMPLIFIED: No-op (giống botkct.py - không cần "in use" flag)
+// Connection is always available, routing is handled by handler active state
+// Kept for backward compatibility but does nothing
 func ReleaseConnection(deviceID string) {
-	connManager.mu.Lock()
-	defer connManager.mu.Unlock()
-
-	if connInfo, exists := connManager.connections[deviceID]; exists {
-		connInfo.InUse = false
-		logger.Println(fmt.Sprintf("[ConnectionManager] Connection for device %s released (no longer in use)", deviceID))
-	}
+	// No-op: Connection is always available, routing handles which handler gets messages
+	// This matches botkct.py behavior: same connection, routing based on handler state
+	logger.Println(fmt.Sprintf("[ConnectionManager] ReleaseConnection called for device %s (no-op, connection always available)", deviceID))
 }
 
 // CheckConnection checks if a connection exists and can be reused (not in use)
@@ -456,16 +449,14 @@ func CheckConnection(deviceID string) (*websocket.Conn, string, bool) {
 
 	conn := connInfo.Conn
 	sessionID := connInfo.SessionID
-	inUse := connInfo.InUse
 	readerRunning := connInfo.ReaderRunning
 
 	// Log detailed status for debugging
-	logger.Println(fmt.Sprintf("[ConnectionManager] CheckConnection for device %s: exists=%v, conn!=nil=%v, valid=%v, inUse=%v, readerRunning=%v",
-		deviceID, exists, conn != nil, conn != nil && IsConnectionValid(conn), inUse, readerRunning))
+	logger.Println(fmt.Sprintf("[ConnectionManager] CheckConnection for device %s: exists=%v, conn!=nil=%v, valid=%v, readerRunning=%v",
+		deviceID, exists, conn != nil, conn != nil && IsConnectionValid(conn), readerRunning))
 
-	// Only return connection if it exists, is valid, NOT in use, and reader is running
-	// If Conn is nil, it means connection has been marked as failed
-	if exists && conn != nil && IsConnectionValid(conn) && !inUse && readerRunning {
+	// Return connection if it exists, is valid, and reader is running (giống botkct.py - đơn giản, không check "in use")
+	if exists && conn != nil && IsConnectionValid(conn) && readerRunning {
 		logger.Println(fmt.Sprintf("[ConnectionManager] CheckConnection: ✅ Connection available for reuse (device: %s, sessionID: %s)", deviceID, sessionID))
 		return conn, sessionID, true
 	}
@@ -475,8 +466,6 @@ func CheckConnection(deviceID string) (*websocket.Conn, string, bool) {
 		logger.Println(fmt.Sprintf("[ConnectionManager] CheckConnection: ❌ Connection is nil (marked as failed) for device %s", deviceID))
 	} else if !IsConnectionValid(conn) {
 		logger.Println(fmt.Sprintf("[ConnectionManager] CheckConnection: ❌ Connection is invalid (RemoteAddr is nil) for device %s", deviceID))
-	} else if inUse {
-		logger.Println(fmt.Sprintf("[ConnectionManager] CheckConnection: ❌ Connection is IN USE for device %s", deviceID))
 	} else if !readerRunning {
 		logger.Println(fmt.Sprintf("[ConnectionManager] CheckConnection: ❌ Reader goroutine is NOT RUNNING for device %s", deviceID))
 	}
@@ -484,14 +473,11 @@ func CheckConnection(deviceID string) (*websocket.Conn, string, bool) {
 	return nil, "", false
 }
 
-// IsConnectionInUse checks if a connection is currently being used
+// IsConnectionInUse - SIMPLIFIED: Always returns false (giống botkct.py - không có "in use" concept)
+// Connection is always available, routing handles which handler gets messages
 func IsConnectionInUse(deviceID string) bool {
-	connManager.mu.RLock()
-	defer connManager.mu.RUnlock()
-
-	if connInfo, exists := connManager.connections[deviceID]; exists {
-		return connInfo.InUse
-	}
+	// Always return false - connection is always available (giống botkct.py)
+	// Routing is handled by handler active state, not "in use" flag
 	return false
 }
 

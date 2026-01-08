@@ -219,53 +219,13 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 		storedConn, storedSessionID, connectionExists := xiaozhi.CheckConnectionExists(deviceID)
 		connectionValid := connectionExists && storedConn != nil && storedConn.RemoteAddr() != nil && xiaozhi.IsReaderRunning(deviceID)
 
-		// Only wait for LLM to finish if connection exists and is valid AND is in use
-		if connectionValid && xiaozhi.IsConnectionInUse(deviceID) {
-			// Check if connection exists and can be reused (not in use)
-			// Đợi cho đến khi connection được release (LLM xong) - không tạo connection mới
-			// Chỉ tạo connection mới khi connection cũ đã đóng hoàn toàn
-			maxWaitTime := 30 * time.Second // Đợi lâu hơn để LLM hoàn thành audio
-			waitInterval := 500 * time.Millisecond
-			waited := 0 * time.Millisecond
-
-			// Đợi cho đến khi connection được release (LLM xong)
-			for xiaozhi.IsConnectionInUse(deviceID) && waited < maxWaitTime {
-				// Check context deadline
-				select {
-				case <-ctx.Done():
-					safeLog("Xiaozhi STT: ⚠️  Context deadline exceeded while waiting for connection release (waited: %v)", waited)
-					return "", fmt.Errorf("context deadline exceeded while waiting for LLM to finish: %w", ctx.Err())
-				default:
-				}
-
-				// Re-check if connection is still valid (might have been closed)
-				// Use CheckConnectionExists to check if connection still exists (regardless of in-use status)
-				if storedConn, _, exists := xiaozhi.CheckConnectionExists(deviceID); !exists || storedConn == nil || storedConn.RemoteAddr() == nil || !xiaozhi.IsReaderRunning(deviceID) {
-					safeLog("Xiaozhi STT: ⚠️  Connection was closed while waiting for LLM, will create new connection")
-					connectionValid = false
-					break
-				}
-
-				safeLog("Xiaozhi STT: ⏳ Connection for device %s is IN USE by LLM, waiting for release (waited: %v)...", deviceID, waited)
-
-				// Use context-aware sleep
-				select {
-				case <-ctx.Done():
-					safeLog("Xiaozhi STT: ⚠️  Context deadline exceeded while waiting for connection release (waited: %v)", waited)
-					return "", fmt.Errorf("context deadline exceeded while waiting for LLM to finish: %w", ctx.Err())
-				case <-time.After(waitInterval):
-					waited += waitInterval
-				}
-			}
-
-			if waited >= maxWaitTime {
-				safeLog("Xiaozhi STT: ⚠️  Connection for device %s still IN USE after %v, timeout - connection may be stuck", deviceID, maxWaitTime)
-				return "", fmt.Errorf("connection for device %s is still in use by LLM after %v, cannot proceed", deviceID, maxWaitTime)
-			} else if waited > 0 && connectionValid {
-				safeLog("Xiaozhi STT: ✅ Connection for device %s released after %v, waiting a bit more for LLM reader to fully stop...", deviceID, waited)
-				// Wait a bit more to ensure LLM reader goroutine has fully stopped
-				time.Sleep(200 * time.Millisecond)
-			}
+		// SIMPLIFIED: No need to wait for "in use" (giống botkct.py - connection luôn available)
+		// Connection can be used immediately if valid, routing handles which handler gets messages
+		// Only check if connection is valid, not if it's "in use"
+		if connectionValid {
+			// Connection exists and is valid - can use immediately
+			// No need to wait for "release" - connection is always available (giống botkct.py)
+			safeLog("Xiaozhi STT: ✅ Connection for device %s is valid and available (giống botkct.py - no 'in use' concept)", deviceID)
 		}
 
 		// Re-check connection after waiting (it might have been closed)
