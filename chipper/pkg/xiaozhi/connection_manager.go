@@ -258,9 +258,18 @@ func SetLLMHandler(deviceID string, handler MessageHandler) {
 
 	if connInfo, exists := connManager.connections[deviceID]; exists {
 		connInfo.mu.Lock()
+		// Clear old handler if exists (deactivate it to prevent race conditions)
+		if connInfo.LLMHandler != nil {
+			connInfo.LLMHandler.SetActive(false)
+			logger.Println(fmt.Sprintf("[ConnectionManager] Old LLM handler deactivated for device: %s", deviceID))
+		}
+		// Set new handler and ensure it's active
 		connInfo.LLMHandler = handler
+		if handler != nil {
+			handler.SetActive(true)
+		}
 		connInfo.mu.Unlock()
-		logger.Println(fmt.Sprintf("[ConnectionManager] LLM handler set for device: %s", deviceID))
+		logger.Println(fmt.Sprintf("[ConnectionManager] LLM handler set for device: %s (active: true)", deviceID))
 	}
 }
 

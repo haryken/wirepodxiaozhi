@@ -258,11 +258,21 @@ func (h *LLMHandler) HandleMessage(messageType int, message []byte) error {
 		h.mu.Unlock()
 
 		// Skip if vclient or opusDecoder is nil
+		// IMPORTANT: Log every frame if nil to debug race condition
 		if vclient == nil || opusDecoder == nil {
-			if count == 1 || count%50 == 0 {
-				logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ⚠️  Skipping audio frame (vclient or opusDecoder is nil, frame #%d)", count))
+			// Log every frame if nil (especially frame #1) to debug race condition
+			logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ⚠️  Skipping audio frame (vclient or opusDecoder is nil, frame #%d) - vclient: %v, opusDecoder: %v", count, vclient != nil, opusDecoder != nil))
+			// Try to get vclient and opusDecoder again (may have been set after handler registration)
+			h.mu.RLock()
+			vclient = h.vclient
+			opusDecoder = h.opusDecoder
+			h.mu.RUnlock()
+			// If still nil, return
+			if vclient == nil || opusDecoder == nil {
+				return nil
 			}
-			return nil
+			// If now available, continue processing (don't skip frame)
+			logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ✅ vclient/opusDecoder now available, processing frame #%d", count))
 		}
 
 		// Decode OPUS → PCM
@@ -681,16 +691,8 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 			return "", fmt.Errorf("failed to send text query: %w", err)
 		}
 	}
-	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Text query sent successfully to server", esn))
-	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ========================================", esn))
-
-	// Step 3: Note - xiaozhi expects audio input, not text
-	// Since we already have transcribed text from STT, we need to:
-	// Option 1: Use TTS to convert text back to audio (not ideal)
-	// Option 2: Use xiaozhi's text query feature if available
-	// Option 3: For now, we'll just wait for any audio response from xiaozhi
-	// In a real implementation, you'd send the audio that was transcribed
-
+	// Step 3: Create LLM handler FIRST (before sending text query)
+	// This ensures handler is ready when server sends llm/tts events immediately after text query
 	textResponse := make(chan string, 5) // Increased buffer to handle both LLM and TTS sentence_start events
 	errChan := make(chan error, 1)
 	ttsStopChan := make(chan bool, 1) // Signal when TTS stops (for connection release timing)
@@ -701,12 +703,24 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 		errChan:                 errChan,
 		ttsStopChan:             ttsStopChan,
 		audioStreamCompleteChan: make(chan bool, 1), // Signal when AudioStreamComplete has been sent
-		active:                  true,
+		active:                  false,              // Will be activated when registered
 		audioChunkCount:         0,
 		accumulatedBuffer:       []byte{},
 		chunkCount:              0,
 		audioQueueStarted:       false,
 	}
+
+	// IMPORTANT: Register LLM handler BEFORE sending text query
+	// This prevents "No active handler" errors when server sends llm/tts events immediately
+	if deviceID != "" {
+		// Register handler early (before audio setup) to catch early messages
+		// Handler will be inactive initially, but will be activated after audio setup
+		xiaozhi.SetLLMHandler(deviceID, llmHandler)
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ LLM handler registered EARLY (before text query) to catch server messages", esn))
+	}
+
+	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Text query sent successfully to server", esn))
+	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ========================================", esn))
 
 	// Setup audio playback client FIRST (only if robot connection exists)
 	// IMPORTANT: Setup audio BEFORE registering LLM handler to avoid race condition
@@ -781,12 +795,24 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 			llmHandler.flushTimerStop = make(chan bool, 1)
 			llmHandler.mu.Unlock()
 			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Audio processing setup complete (synchronous mode)", esn))
+
+			// IMPORTANT: Add small delay to ensure vclient and opusDecoder are fully set
+			// This prevents race condition where audio frames arrive before setup is complete
+			time.Sleep(100 * time.Millisecond)
+
 			// Start audio queue
 			WaitForAudio_Queue(esn)
 			StartAudio_Queue(esn)
 			llmHandler.mu.Lock()
 			llmHandler.audioQueueStarted = true
 			llmHandler.mu.Unlock()
+
+			// Double-check that vclient and opusDecoder are set before proceeding
+			llmHandler.mu.RLock()
+			vclientReady := llmHandler.vclient != nil
+			opusDecoderReady := llmHandler.opusDecoder != nil
+			llmHandler.mu.RUnlock()
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Pre-registration check - vclient ready: %v, opusDecoder ready: %v", esn, vclientReady, opusDecoderReady))
 
 			// Start flush timer goroutine to send small buffers periodically
 			go func() {
@@ -822,11 +848,19 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 							})
 							if err != nil {
 								if strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "closed") {
+									// vclient stream bị đóng - có thể do robot đóng stream hoặc context bị cancel
+									// Log warning nhưng KHÔNG set vclient = nil ngay lập tức
+									// Để audio frames tiếp tục được xử lý nếu stream được recreate
+									logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ⚠️  vclient stream closed (EOF/closed) - may be temporary, continuing to process frames"))
 									llmHandler.mu.Lock()
 									llmHandler.vclient = nil
 									llmHandler.mu.Unlock()
-									return
+									// KHÔNG return ngay - tiếp tục chờ để xem có frames mới không
+									// Chỉ return nếu stream thực sự đóng (sẽ được detect ở lần flush tiếp theo)
+									continue
 								}
+								// Other errors - log and continue
+								logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ⚠️  Error sending audio chunk: %v", err))
 							} else {
 								llmHandler.mu.Lock()
 								llmHandler.chunkCount++
@@ -844,11 +878,27 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 		}
 	}
 
-	// Register LLM handler with connection manager AFTER audio setup is complete
-	// This ensures opusDecoder is ready when first audio frame arrives
+	// Update LLM handler with audio setup AFTER audio is ready
+	// Handler was already registered early (before text query) to catch server messages
+	// Now we just need to update it with vclient and opusDecoder
 	if deviceID != "" {
+		// Log audio setup status
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Updating LLM handler with audio setup - vclient != nil: %v, audioPrepareSent: %v, opusDecoder != nil: %v",
+			esn, vclient != nil, audioPrepareSent, llmHandler.opusDecoder != nil))
+
+		// Ensure handler is active (it was registered early but may be inactive)
+		llmHandler.SetActive(true)
+
+		// Re-register handler to ensure it's active and has latest state
 		xiaozhi.SetLLMHandler(deviceID, llmHandler)
-		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | LLM handler registered for device %s (connFromSTT: %v, audio ready: %v)", esn, deviceID, connFromSTT, vclient != nil && audioPrepareSent))
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ LLM handler updated with audio setup (connFromSTT: %v, audio ready: %v)", esn, connFromSTT, vclient != nil && audioPrepareSent))
+
+		// Double-check that vclient and opusDecoder are set after registration
+		llmHandler.mu.RLock()
+		vclientSet := llmHandler.vclient != nil
+		opusDecoderSet := llmHandler.opusDecoder != nil
+		llmHandler.mu.RUnlock()
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ After audio setup - vclient set: %v, opusDecoder set: %v", esn, vclientSet, opusDecoderSet))
 	}
 
 	// No separate reader goroutine - using connection manager's reader
@@ -882,19 +932,39 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 	// Audio processing is now synchronous - handled directly in LLM handler when receiving Opus frames
 	// Setup DoNewRequest trigger after TTS stops (in a separate goroutine to avoid blocking)
 	go func() {
-		defer audioCancelSafe()    // Cancel audio context when done
-		defer StopAudio_Queue(esn) // Mark audio as finished when done
+		// IMPORTANT: KHÔNG cancel audio context hoặc stop audio queue khi timeout
+		// Chỉ cancel/stop khi TTS thực sự dừng (nhận được TTS stop event)
+		// Điều này đảm bảo audio playback không bị interrupt khi TTS dài
+		ttsStopped := false
+		defer func() {
+			// Chỉ cancel audio context và stop audio queue khi TTS đã dừng
+			// Không cancel nếu timeout (TTS vẫn đang tiếp tục)
+			if ttsStopped {
+				// TTS đã dừng - safe to cancel
+				audioCancelSafe()
+				StopAudio_Queue(esn)
+				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ TTS stopped - audio context canceled and audio queue stopped", esn))
+			} else {
+				// Timeout - TTS vẫn đang tiếp tục, KHÔNG cancel
+				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Timeout - TTS may still be in progress, NOT canceling audio context to avoid interrupting playback", esn))
+			}
+		}()
 
 		// IMPORTANT: Đợi TTS stop event - KHÔNG timeout và tiếp tục nếu TTS vẫn đang tiếp tục
 		// Chỉ gọi DoNewRequest khi TTS thực sự dừng (nhận được TTS stop event từ server)
 		// Điều này đảm bảo robot không bị dừng audio playback giữa chừng
 		select {
 		case <-ttsStopChan:
+			ttsStopped = true
 			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ TTS stop event received (robot dừng nói), waiting for AudioStreamComplete...", esn))
-		case <-time.After(120 * time.Second):
-			// Timeout dài hơn (120s) để đợi TTS dài, nhưng vẫn log warning
-			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Timeout waiting for TTS stop (120s), TTS may still be in progress. NOT calling DoNewRequest to avoid interrupting audio.", esn))
+		case <-time.After(24 * time.Hour):
+			// Timeout rất dài (24 giờ) - thực tế không bao giờ timeout
+			// Chỉ để tránh goroutine chạy mãi mãi nếu có lỗi
+			// Log warning nhưng KHÔNG cancel audio context để audio tiếp tục phát
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Very long timeout reached (24h), TTS/nhạc may still be in progress. NOT calling DoNewRequest to avoid interrupting audio.", esn))
 			// KHÔNG tiếp tục - return để tránh interrupt audio playback
+			// KHÔNG cancel audio context - để audio tiếp tục phát
+			// ttsStopped vẫn là false, defer sẽ không cancel audio context
 			return
 		}
 
@@ -1091,8 +1161,10 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 						xiaozhi.ReleaseConnection(deviceID)
 						logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Connection released (STT handler will handle next request)", esn))
 					}
-				case <-time.After(120 * time.Second):
-					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Timeout waiting for TTS stop (120s), releasing connection anyway", esn))
+				case <-time.After(24 * time.Hour):
+					// Timeout rất dài (24 giờ) - thực tế không bao giờ timeout
+					// Chỉ để tránh goroutine chạy mãi mãi nếu có lỗi
+					logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Very long timeout reached (24h), releasing connection anyway", esn))
 					// Deactivate LLM handler - connection manager's reader will route messages to STT handler
 					if deviceID != "" {
 						llmHandler.SetActive(false)
