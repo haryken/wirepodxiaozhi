@@ -691,6 +691,108 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 		vclientLocal := vclient
 		audioPrepareSentLocal := audioPrepareSent
 
+		// Use sync.Once to ensure only one goroutine triggers DoNewRequest
+		// But we'll call DoNewRequest multiple times (10 times) with delays to increase success rate
+		// Robot might not be idle immediately, so retrying increases chance of success
+		var doNewRequestOnce sync.Once
+		triggerDoNewRequest := func() {
+			if shouldContinueConversation && robot != nil {
+				doNewRequestOnce.Do(func() {
+					safeLog("[Xiaozhi TTS] Device: %s | 🎤 Starting continuous listening trigger...", esn)
+					go func() {
+						// Activate STT handler BEFORE calling DoNewRequest
+						if vars.APIConfig.Knowledge.Provider == "xiaozhi" && deviceID != "" {
+							if activated := xiaozhi.ActivateSTTHandler(deviceID); activated {
+								safeLog("[Xiaozhi TTS] Device: %s | ✅ STT handler activated", esn)
+							}
+							// Send listen start message to xiaozhi server
+							listenStart := map[string]interface{}{
+								"type":  "listen",
+								"state": "start",
+								"mode":  "auto",
+							}
+							if err := xiaozhi.WriteJSON(deviceID, listenStart); err == nil {
+								safeLog("[Xiaozhi TTS] Device: %s | ✅ Listen start message sent to xiaozhi server", esn)
+							}
+						}
+
+						// Call DoNewRequest 2 times with shorter delay between attempts
+						// This increases chance of success if robot is not immediately idle
+						maxAttempts := 2
+						attemptInterval := 500 * time.Millisecond // Reduced from 1s to 500ms for faster retry
+						timeout := 10 * time.Second               // Increased timeout to accommodate faster retries
+						timeoutChan := time.After(timeout)
+
+						for attempt := 1; attempt <= maxAttempts; attempt++ {
+							// Check timeout
+							select {
+							case <-timeoutChan:
+								safeLog("[Xiaozhi TTS] Device: %s | ⏱️  Timeout reached (%v), stopping DoNewRequest attempts", esn, timeout)
+								return
+							default:
+							}
+
+							// Check if robot is already listening (STT handler active AND receiving audio chunks)
+							// This is more reliable than just checking STT handler active status
+							if vars.APIConfig.Knowledge.Provider == "xiaozhi" && deviceID != "" {
+								if xiaozhi.IsRobotListening(deviceID) {
+									safeLog("[Xiaozhi TTS] Device: %s | ✅ Robot is already listening (receiving audio chunks), skipping DoNewRequest (attempt %d/%d)", esn, attempt, maxAttempts)
+									return // Robot is already listening, exit
+								}
+								// Also check if STT handler is active (robot might be ready but not sending audio yet)
+								if xiaozhi.IsSTTHandlerActive(deviceID) {
+									safeLog("[Xiaozhi TTS] Device: %s | ⚠️  STT handler is active but no audio chunks received yet, will still try DoNewRequest (attempt %d/%d)", esn, attempt, maxAttempts)
+								}
+							}
+
+							safeLog("[Xiaozhi TTS] Device: %s | 📞 Attempt %d/%d: Calling DoNewRequest() to trigger robot listening...", esn, attempt, maxAttempts)
+							DoNewRequest(robot)
+							safeLog("[Xiaozhi TTS] Device: %s | ✅ DoNewRequest() called (attempt %d/%d)", esn, attempt, maxAttempts)
+
+							// After calling DoNewRequest, wait longer and check if robot is listening
+							// Robot needs more time to actually open mic after AppIntent
+							// DoNewRequest already waits 1.5s after AppIntent, so we wait a bit more here
+							time.Sleep(500 * time.Millisecond) // Additional wait after DoNewRequest completes
+							if vars.APIConfig.Knowledge.Provider == "xiaozhi" && deviceID != "" {
+								// First check if robot is actually sending audio chunks (most reliable)
+								if xiaozhi.IsRobotListening(deviceID) {
+									safeLog("[Xiaozhi TTS] Device: %s | ✅ Robot is now listening (receiving audio chunks), stopping attempts", esn)
+									return // Success - robot is listening and sending audio
+								}
+								// If STT handler is active, wait a bit more and check again
+								// Robot might need more time to actually open mic
+								if xiaozhi.IsSTTHandlerActive(deviceID) {
+									safeLog("[Xiaozhi TTS] Device: %s | ⚠️  STT handler is active but no audio chunks yet, waiting 1 more second to verify robot opened mic...", esn)
+									time.Sleep(1 * time.Second)
+									// Check again after additional wait
+									if xiaozhi.IsRobotListening(deviceID) {
+										safeLog("[Xiaozhi TTS] Device: %s | ✅ Robot is now listening (receiving audio chunks after additional wait), stopping attempts", esn)
+										return // Success - robot is listening and sending audio
+									}
+									// Still no audio chunks, but STT handler is active
+									// This might mean robot is ready but user hasn't spoken yet
+									// For now, continue to attempt 2 to be safe
+									safeLog("[Xiaozhi TTS] Device: %s | ⚠️  STT handler active but still no audio chunks - robot might not have opened mic yet, will try attempt %d/%d", esn, attempt+1, maxAttempts)
+								}
+							}
+
+							// If not last attempt, wait before next attempt
+							if attempt < maxAttempts {
+								select {
+								case <-timeoutChan:
+									safeLog("[Xiaozhi TTS] Device: %s | ⏱️  Timeout reached, stopping attempts", esn)
+									return
+								case <-time.After(attemptInterval):
+									// Continue to next attempt
+								}
+							}
+						}
+						safeLog("[Xiaozhi TTS] Device: %s | ✅ Completed all %d DoNewRequest attempts", esn, maxAttempts)
+					}()
+				})
+			}
+		}
+
 		// Wait a bit for vclient to be created and AudioStreamPrepare to be sent
 		// Check vclient status with timeout
 		maxWaitTime := 5 * time.Second
@@ -780,33 +882,14 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 						safeLog("[Xiaozhi TTS] Device: %s | ⚠️  ERROR - Failed to send AudioStreamComplete: %v", esn, err)
 					} else {
 						safeLog("[Xiaozhi TTS] Device: %s | ✅ Audio stream complete sent to robot (total chunks sent: %d)", esn, chunkCount)
-
-						// CRITICAL: Trigger DoNewRequest IMMEDIATELY after AudioStreamComplete
-						// Robot is now idle and ready to accept AppIntent
+						// Call DoNewRequest immediately after AudioStreamComplete (case 1: TTS done signal)
 						if shouldContinueConversation && robot != nil {
-							safeLog("[Xiaozhi TTS] Device: %s | 🎤 Triggering continuous listening IMMEDIATELY after AudioStreamComplete...", esn)
-							go func() {
-								// Activate STT handler BEFORE calling DoNewRequest
-								if vars.APIConfig.Knowledge.Provider == "xiaozhi" && deviceID != "" {
-									if activated := xiaozhi.ActivateSTTHandler(deviceID); activated {
-										safeLog("[Xiaozhi TTS] Device: %s | ✅ STT handler activated", esn)
-									}
-									// Send listen start message to xiaozhi server
-									listenStart := map[string]interface{}{
-										"type":  "listen",
-										"state": "start",
-										"mode":  "auto",
-									}
-									if err := xiaozhi.WriteJSON(deviceID, listenStart); err == nil {
-										safeLog("[Xiaozhi TTS] Device: %s | ✅ Listen start message sent to xiaozhi server", esn)
-									}
-								}
-								// Call DoNewRequest immediately - robot is already idle
-								safeLog("[Xiaozhi TTS] Device: %s | 📞 Calling DoNewRequest() immediately after AudioStreamComplete...", esn)
-								DoNewRequest(robot)
-								safeLog("[Xiaozhi TTS] Device: %s | ✅ Continuous listening triggered", esn)
-							}()
+							safeLog("[Xiaozhi TTS] Device: %s | 🚀 Calling DoNewRequest() IMMEDIATELY after AudioStreamComplete...", esn)
+							DoNewRequest(robot)
+							safeLog("[Xiaozhi TTS] Device: %s | ✅ DoNewRequest() called immediately", esn)
 						}
+						// Also trigger the retry mechanism
+						triggerDoNewRequest()
 					}
 				} else {
 					safeLog("[Xiaozhi TTS] Device: %s | ⚠️  vclient is nil, cannot send AudioStreamComplete", esn)
@@ -855,33 +938,14 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 							safeLog("[Xiaozhi TTS] Device: %s | ⚠️  ERROR - Failed to send AudioStreamComplete: %v", esn, err)
 						} else {
 							safeLog("[Xiaozhi TTS] Device: %s | ✅ Audio stream complete sent to robot (total chunks sent: %d)", esn, chunkCount)
-
-							// CRITICAL: Trigger DoNewRequest IMMEDIATELY after AudioStreamComplete
-							// Robot is now idle and ready to accept AppIntent
+							// Call DoNewRequest immediately after AudioStreamComplete (case 2: audio channel closed)
 							if shouldContinueConversation && robot != nil {
-								safeLog("[Xiaozhi TTS] Device: %s | 🎤 Triggering continuous listening IMMEDIATELY after AudioStreamComplete...", esn)
-								go func() {
-									// Activate STT handler BEFORE calling DoNewRequest
-									if vars.APIConfig.Knowledge.Provider == "xiaozhi" && deviceID != "" {
-										if activated := xiaozhi.ActivateSTTHandler(deviceID); activated {
-											safeLog("[Xiaozhi TTS] Device: %s | ✅ STT handler activated", esn)
-										}
-										// Send listen start message to xiaozhi server
-										listenStart := map[string]interface{}{
-											"type":  "listen",
-											"state": "start",
-											"mode":  "auto",
-										}
-										if err := xiaozhi.WriteJSON(deviceID, listenStart); err == nil {
-											safeLog("[Xiaozhi TTS] Device: %s | ✅ Listen start message sent to xiaozhi server", esn)
-										}
-									}
-									// Call DoNewRequest immediately - robot is already idle
-									safeLog("[Xiaozhi TTS] Device: %s | 📞 Calling DoNewRequest() immediately after AudioStreamComplete...", esn)
-									DoNewRequest(robot)
-									safeLog("[Xiaozhi TTS] Device: %s | ✅ Continuous listening triggered", esn)
-								}()
+								safeLog("[Xiaozhi TTS] Device: %s | 🚀 Calling DoNewRequest() IMMEDIATELY after AudioStreamComplete...", esn)
+								DoNewRequest(robot)
+								safeLog("[Xiaozhi TTS] Device: %s | ✅ DoNewRequest() called immediately", esn)
 							}
+							// Also trigger the retry mechanism
+							triggerDoNewRequest()
 						}
 					} else {
 						safeLog("[Xiaozhi TTS] Device: %s | ⚠️  vclient is nil, cannot send AudioStreamComplete", esn)

@@ -19,15 +19,16 @@ type MessageHandler interface {
 
 // ConnectionInfo stores connection information and message handlers
 type ConnectionInfo struct {
-	Conn          *websocket.Conn
-	SessionID     string
-	InUse         bool
-	STTHandler    MessageHandler
-	LLMHandler    MessageHandler
-	ReaderRunning bool
-	ReaderStop    chan struct{}
-	mu            sync.RWMutex // For reading ConnectionInfo fields
-	writeMu       sync.Mutex   // For serializing writes to WebSocket connection (WebSocket is not thread-safe for concurrent writes)
+	Conn              *websocket.Conn
+	SessionID         string
+	InUse             bool
+	STTHandler        MessageHandler
+	LLMHandler        MessageHandler
+	ReaderRunning     bool
+	ReaderStop        chan struct{}
+	LastAudioChunkTime time.Time // Track when last audio chunk was received from robot (indicates robot is listening)
+	mu                sync.RWMutex // For reading ConnectionInfo fields
+	writeMu           sync.Mutex   // For serializing writes to WebSocket connection (WebSocket is not thread-safe for concurrent writes)
 }
 
 // ConnectionManager manages WebSocket connections per device
@@ -274,6 +275,60 @@ func ActivateSTTHandler(deviceID string) bool {
 	}
 	logger.Println(fmt.Sprintf("[ConnectionManager] No connection found for device: %s", deviceID))
 	return false
+}
+
+// IsSTTHandlerActive checks if STT handler is currently active for a device
+// This indicates robot might be listening or ready to receive audio
+func IsSTTHandlerActive(deviceID string) bool {
+	connManager.mu.RLock()
+	defer connManager.mu.RUnlock()
+
+	if connInfo, exists := connManager.connections[deviceID]; exists {
+		connInfo.mu.RLock()
+		defer connInfo.mu.RUnlock()
+		if connInfo.STTHandler != nil {
+			return connInfo.STTHandler.IsActive()
+		}
+	}
+	return false
+}
+
+// IsRobotListening checks if robot is currently listening (sending audio chunks)
+// Returns true if STT handler is active AND robot has sent audio chunks recently (within last 2 seconds)
+// This is more reliable than just checking STT handler active status
+func IsRobotListening(deviceID string) bool {
+	connManager.mu.RLock()
+	defer connManager.mu.RUnlock()
+
+	if connInfo, exists := connManager.connections[deviceID]; exists {
+		connInfo.mu.RLock()
+		defer connInfo.mu.RUnlock()
+		if connInfo.STTHandler != nil && connInfo.STTHandler.IsActive() {
+			// Check if robot has sent audio chunks recently (within last 2 seconds)
+			// If LastAudioChunkTime is zero, robot hasn't sent audio yet
+			if !connInfo.LastAudioChunkTime.IsZero() {
+				timeSinceLastChunk := time.Since(connInfo.LastAudioChunkTime)
+				if timeSinceLastChunk < 2*time.Second {
+					// Robot sent audio chunks recently - it's listening
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// UpdateLastAudioChunkTime updates the timestamp when robot last sent audio chunk
+// This should be called by STT handler when it receives audio from robot
+func UpdateLastAudioChunkTime(deviceID string) {
+	connManager.mu.Lock()
+	defer connManager.mu.Unlock()
+
+	if connInfo, exists := connManager.connections[deviceID]; exists {
+		connInfo.mu.Lock()
+		connInfo.LastAudioChunkTime = time.Now()
+		connInfo.mu.Unlock()
+	}
 }
 
 // StoreConnection stores a WebSocket connection for a device

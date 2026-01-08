@@ -786,6 +786,11 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 				return
 			default:
 				chunk, err := sreq.GetNextStreamChunkOpus()
+				// Update last audio chunk time when we receive audio from robot
+				// This indicates robot is listening and sending audio
+				if err == nil && len(chunk) > 0 && deviceID != "" {
+					xiaozhi.UpdateLastAudioChunkTime(deviceID)
+				}
 				if err != nil {
 					if err == io.EOF {
 						logger.Println(fmt.Sprintf("Xiaozhi STT: End of audio stream (EOF) detected after %d chunks", chunkCount))

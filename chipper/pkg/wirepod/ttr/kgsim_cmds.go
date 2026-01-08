@@ -625,15 +625,16 @@ func DoNewRequest(robot *vector.Vector) {
 	logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] Triggering continuous listening...", esn))
 
 	// IMPORTANT: This is called IMMEDIATELY after AudioStreamComplete
-	// Robot should already be idle, but we need a very short delay for robot to process
-	// Reduced delay since we're calling immediately after AudioStreamComplete
-	logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ⏳ Very short delay to ensure robot processed AudioStreamComplete (300ms)...", esn))
-	time.Sleep(300 * time.Millisecond) // Very short delay - robot should already be idle
+	// Robot should already be idle, but we need a short delay for robot to process AudioStreamComplete
+	logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ⏳ Delay to ensure robot processed AudioStreamComplete and is idle (500ms)...", esn))
+	time.Sleep(500 * time.Millisecond) // Reduced delay for faster retry
 
-	// Retry logic: Try AppIntent up to 3 times with delays
-	maxRetries := 3
-	retryDelay := 500 * time.Millisecond
+	// Retry logic: Try AppIntent up to 5 times with shorter delays (faster retry)
+	// IMPORTANT: Send AppIntent multiple times even when successful to ensure robot opens mic
+	maxRetries := 5
+	retryDelay := 300 * time.Millisecond // Reduced from 500ms to 300ms for faster retry
 	var lastErr error
+	successCount := 0
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] 📞 Attempt %d/%d: Sending AppIntent(knowledge_question) to robot...", esn, attempt, maxRetries))
@@ -658,12 +659,20 @@ func DoNewRequest(robot *vector.Vector) {
 			} else {
 				logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ✅ AppIntent sent successfully (no response data)", esn))
 			}
-			logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ✅ AppIntent(knowledge_question) sent successfully (attempt %d/%d) - robot should now be listening for next question", esn, attempt, maxRetries))
-			// Additional delay after successful AppIntent to allow robot to process and open mic
-			logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ⏳ Waiting for robot to process AppIntent and open mic (500ms)...", esn))
-			time.Sleep(500 * time.Millisecond)
-			logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ✅ Robot should now be listening - mic should be open", esn))
-			return // Success, exit function
+			successCount++
+			logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ✅ AppIntent(knowledge_question) sent successfully (attempt %d/%d, success count: %d)", esn, attempt, maxRetries, successCount))
+
+			// Send AppIntent multiple times even when successful to ensure robot opens mic
+			// Don't return immediately - continue sending to "wake up" robot
+			if attempt < maxRetries {
+				logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ⏳ Sending additional AppIntent to ensure robot opens mic (will send %d more times)...", esn, maxRetries-attempt))
+				time.Sleep(retryDelay) // Short delay before next AppIntent
+			} else {
+				// Last attempt - wait longer for robot to process
+				logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ⏳ Waiting for robot to process AppIntent and open mic (1s)...", esn))
+				time.Sleep(1 * time.Second)
+				logger.Println(fmt.Sprintf("DoNewRequest: [Device: %s] ✅ Robot should now be listening - mic should be open (sent %d successful AppIntents)", esn, successCount))
+			}
 		}
 	}
 
