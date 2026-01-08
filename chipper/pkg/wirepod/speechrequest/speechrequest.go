@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strings"
 	"time"
 
 	pb "github.com/digital-dream-labs/api/go/chipperpb"
@@ -66,9 +67,27 @@ func (req *SpeechRequest) OpusDetect() bool {
 
 func (req *SpeechRequest) OpusDecode(chunk []byte) []byte {
 	if req.IsOpus {
+		if req.OpusStream == nil {
+			logger.Println("OpusDecode: ERROR - OpusStream is nil, cannot decode")
+			return []byte{}
+		}
 		n, err := req.OpusStream.Decode(chunk)
 		if err != nil {
-			logger.Println(err)
+			// Log lỗi nhưng không spam (chỉ log mỗi 50 lỗi hoặc lỗi đầu tiên)
+			// Lỗi "opus: corrupted stream" có thể xảy ra khi:
+			// 1. OGG packets bị fragment (không đầy đủ)
+			// 2. OpusStream state bị corrupt (khi reuse connection)
+			// 3. OGG packet không hợp lệ
+			// Giải pháp: Return empty để skip chunk này, OpusStream sẽ tự recover ở packet tiếp theo
+			if strings.Contains(err.Error(), "corrupted") {
+				// Corrupted stream - có thể do fragment hoặc incomplete packet
+				// Không log mỗi lần để tránh spam, chỉ log thỉnh thoảng
+				// OpusStream sẽ tự recover khi nhận được packet hợp lệ tiếp theo
+			} else {
+				logger.Println(fmt.Sprintf("OpusDecode: ERROR - %v (chunk size: %d bytes)", err, len(chunk)))
+			}
+			// Return empty để skip chunk corrupt này
+			return []byte{}
 		}
 		return n
 	} else {

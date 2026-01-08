@@ -57,27 +57,52 @@ func (h *STTHandler) HandleMessage(messageType int, message []byte) error {
 
 		switch eventType {
 		case "stt":
-			if text, ok := event["text"].(string); ok && text != "" {
-				logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ✅ STT transcript: '%s'", text))
-				// Use recover to handle panic if channel is closed
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							// Channel is closed - this can happen if STT request completed but ConnectionManager
-							// still receives messages from the server
-							logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ⚠️  transcriptChan is closed, dropping transcript (recovered from panic: %v)", r))
+			if text, ok := event["text"].(string); ok {
+				if text != "" {
+					// Non-empty transcript
+					logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ✅ STT transcript: '%s'", text))
+					// Use recover to handle panic if channel is closed
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								// Channel is closed - this can happen if STT request completed but ConnectionManager
+								// still receives messages from the server
+								logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ⚠️  transcriptChan is closed, dropping transcript (recovered from panic: %v)", r))
+							}
+						}()
+						select {
+						case h.transcriptChan <- text:
+							logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ✅ Transcript sent to channel: '%s'", text))
+							h.mu.Lock()
+							h.transcriptReceived = true
+							h.mu.Unlock()
+						default:
+							logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ⚠️  transcriptChan is full, dropping transcript"))
 						}
 					}()
-					select {
-					case h.transcriptChan <- text:
-						logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ✅ Transcript sent to channel: '%s'", text))
-						h.mu.Lock()
-						h.transcriptReceived = true
-						h.mu.Unlock()
-					default:
-						logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ⚠️  transcriptChan is full, dropping transcript"))
-					}
-				}()
+				} else {
+					// Empty transcript from server - send to channel immediately to avoid timeout
+					logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ⚠️  Received empty transcript from server (stt event with empty text)"))
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ⚠️  transcriptChan is closed, dropping empty transcript (recovered from panic: %v)", r))
+							}
+						}()
+						select {
+						case h.transcriptChan <- "":
+							logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ✅ Empty transcript sent to channel (server returned empty text)"))
+							h.mu.Lock()
+							h.transcriptReceived = true
+							h.mu.Unlock()
+						default:
+							logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ⚠️  transcriptChan is full, dropping empty transcript"))
+						}
+					}()
+				}
+			} else {
+				// Server sent "stt" event but no "text" field
+				logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ⚠️  Received 'stt' event but no 'text' field in event: %v", event))
 			}
 		case "error":
 			// Use recover to handle panic if channels are closed
@@ -843,9 +868,22 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 
 					if isOGG {
 						// Decode OGG → PCM
+						// LƯU Ý: OpusStream có thể bị corrupt nếu OGG packets bị fragment hoặc incomplete
+						// Khi reuse connection, cần đảm bảo OpusStream state được reset đúng cách
 						decodedPCM := sreq.OpusDecode(chunk)
 						if len(decodedPCM) == 0 {
-							// Skip empty chunks
+							// Skip empty chunks (có thể do lỗi decode hoặc corrupt stream)
+							// Log để debug nhưng không spam
+							if chunkCount%50 == 0 || chunkCount == 1 {
+								logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Skipping empty decoded chunk (chunk #%d, %d bytes) - may be corrupt OGG packet", chunkCount, len(chunk)))
+							}
+							continue
+						}
+
+						// Validate decoded PCM data
+						if len(decodedPCM)%2 != 0 {
+							// Invalid PCM data (must be even number of bytes for int16 samples)
+							logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Invalid PCM data length (%d bytes, not even) - skipping chunk #%d", len(decodedPCM), chunkCount))
 							continue
 						}
 

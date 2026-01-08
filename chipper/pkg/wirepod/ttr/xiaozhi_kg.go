@@ -295,7 +295,21 @@ func (h *LLMHandler) HandleMessage(messageType int, message []byte) error {
 			accumulatedBuffer = append(accumulatedBuffer, c...)
 		}
 
-		// Send audio chunks when buffer >= 256 bytes
+		// Send audio chunks using the same pattern as Play Audio (Vector control beta)
+		// Play Audio logic (from /api-sdk/play_sound):
+		// 1. Chia file PCM thành chunks 1024 bytes
+		// 2. Gửi từng chunk với delay 60ms giữa các chunks
+		// 3. Format: AudioFrameRate: 8000, AudioVolume: 100
+		//
+		// Code hiện tại áp dụng logic tương tự:
+		// - Chunk size ưu tiên: 1024 bytes (giống Play Audio)
+		// - Delay giữa chunks: 60ms (giống Play Audio)
+		// - AudioFrameRate: 8000 (giống Play Audio)
+		// - AudioVolume: 100 (giống Play Audio)
+		// - Gửi AudioStreamComplete khi xong (giống Play Audio)
+		//
+		// Khác biệt: Play Audio chia file trước, code này accumulate buffer real-time
+		// nhưng vẫn ưu tiên gửi chunk 1024 bytes khi buffer đủ lớn
 		h.mu.Lock()
 		for len(accumulatedBuffer) >= 256 {
 			chunkSize := 1024
@@ -305,7 +319,7 @@ func (h *LLMHandler) HandleMessage(messageType int, message []byte) error {
 			chunkToSend := accumulatedBuffer[:chunkSize]
 			accumulatedBuffer = accumulatedBuffer[chunkSize:]
 
-			// Send to robot
+			// Send to robot (same pattern as Play Audio)
 			err := vclient.Send(&vectorpb.ExternalAudioStreamRequest{
 				AudioRequestType: &vectorpb.ExternalAudioStreamRequest_AudioStreamChunk{
 					AudioStreamChunk: &vectorpb.ExternalAudioStreamChunk{
@@ -328,7 +342,7 @@ func (h *LLMHandler) HandleMessage(messageType int, message []byte) error {
 			if h.chunkCount == 1 || h.chunkCount%50 == 0 {
 				logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ✅ Sent audio chunk #%d (%d bytes)", h.chunkCount, len(chunkToSend)))
 			}
-			// Small delay between chunks (like play_sound)
+			// Delay 60ms giữa các chunks (giống Play Audio - /api-sdk/play_sound)
 			time.Sleep(time.Millisecond * 60)
 		}
 		h.accumulatedBuffer = accumulatedBuffer
@@ -718,12 +732,14 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 		} else {
 			vclient = audioClient
 			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Audio playback client created successfully", esn))
-			// Prepare audio stream - use 8kHz like Play Audio feature
+			// Prepare audio stream - sử dụng cùng format như Play Audio (Vector control beta)
+			// Play Audio sử dụng: AudioFrameRate: 8000, AudioVolume: 100
+			// Reference: /api-sdk/play_sound endpoint trong server.go
 			err = vclient.Send(&vectorpb.ExternalAudioStreamRequest{
 				AudioRequestType: &vectorpb.ExternalAudioStreamRequest_AudioStreamPrepare{
 					AudioStreamPrepare: &vectorpb.ExternalAudioStreamPrepare{
-						AudioFrameRate: 8000, // Use 8kHz like Play Audio (works perfectly)
-						AudioVolume:    100,
+						AudioFrameRate: 8000, // 8kHz - giống Play Audio (works perfectly)
+						AudioVolume:    100,  // Volume 100 - giống Play Audio
 					},
 				},
 			})
