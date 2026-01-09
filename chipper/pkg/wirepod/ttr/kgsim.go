@@ -160,13 +160,8 @@ func CreateAIReq(transcribedText, esn string, gpt3tryagain, isKG bool) openai.Ch
 		model = vars.APIConfig.Knowledge.Model
 	}
 
-	// Check if conversation mode is requested
-	conversationMode := false
-	if len(isConversationMode) > 0 {
-		conversationMode = isConversationMode[0]
-	}
-	// Override SaveChat flag if conversation mode is explicitly requested
-	useConversationMode := vars.APIConfig.Knowledge.SaveChat || conversationMode
+	// Use SaveChat flag to determine conversation mode
+	useConversationMode := vars.APIConfig.Knowledge.SaveChat
 	smsg.Content = CreatePrompt(smsg.Content, model, isKG, useConversationMode)
 
 	nChat = append(nChat, smsg)
@@ -194,6 +189,18 @@ func CreateAIReq(transcribedText, esn string, gpt3tryagain, isKG bool) openai.Ch
 }
 
 func StreamingKGSim(req interface{}, esn string, transcribedText string, isKG bool, isConversationMode ...bool) (string, error) {
+	// Check for xiaozhi provider first - it doesn't need robot connection
+	if vars.APIConfig.Knowledge.Provider == "xiaozhi" {
+		// Use xiaozhi WebSocket for real-time voice conversation
+		// Check if conversation mode is requested
+		conversationMode := false
+		if len(isConversationMode) > 0 {
+			conversationMode = isConversationMode[0]
+		}
+		return StreamingXiaozhiKG(esn, transcribedText, isKG, conversationMode)
+	}
+	
+	// For other providers, need robot connection
 	start := make(chan bool)
 	stop := make(chan bool)
 	stopStop := make(chan bool)
@@ -216,30 +223,37 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string, isKG bo
 		var err error
 		robot, err = vector.New(vector.WithSerialNo(esn), vector.WithToken(guid), vector.WithTarget(target))
 		if err != nil {
-			return err.Error(), err
+			logger.Println(fmt.Sprintf("Warning: Failed to create robot connection for ESN %s: %v. Continuing without robot connection.", esn, err))
 		}
 	}
-	_, err := robot.Conn.BatteryState(context.Background(), &vectorpb.BatteryStateRequest{})
-	if err != nil {
-		return "", err
-	}
-	if isKG {
-		BControl(robot, ctx, start, stop)
-		go func() {
-			for {
-				if kgStopLooping {
-					kgReadyToAnswer <- true
-					break
+	// Robot connection is optional - allow TTS/STT to work even without robot
+	if robot != nil {
+		_, err := robot.Conn.BatteryState(context.Background(), &vectorpb.BatteryStateRequest{})
+		if err != nil {
+			logger.Println(fmt.Sprintf("Warning: Failed to get battery state for ESN %s: %v. Continuing without robot connection.", esn, err))
+		}
+		if isKG && robot != nil {
+			BControl(robot, ctx, start, stop)
+			go func() {
+				for {
+					if kgStopLooping {
+						kgReadyToAnswer <- true
+						break
+					}
+					if robot != nil {
+						robot.Conn.PlayAnimation(ctx, &vectorpb.PlayAnimationRequest{
+							Animation: &vectorpb.Animation{
+								Name: "anim_knowledgegraph_searching_01",
+							},
+							Loops: 1,
+						})
+					}
+					time.Sleep(time.Second / 3)
 				}
-				robot.Conn.PlayAnimation(ctx, &vectorpb.PlayAnimationRequest{
-					Animation: &vectorpb.Animation{
-						Name: "anim_knowledgegraph_searching_01",
-					},
-					Loops: 1,
-				})
-				time.Sleep(time.Second / 3)
-			}
-		}()
+			}()
+		}
+	} else {
+		logger.Println(fmt.Sprintf("Robot %s not found in system, but continuing with TTS/STT", esn))
 	}
 	var fullRespText string
 	var fullfullRespText string
@@ -247,14 +261,6 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string, isKG bo
 	var isDone bool
 	var c *openai.Client
 	switch vars.APIConfig.Knowledge.Provider {
-	case "xiaozhi":
-		// Use xiaozhi WebSocket for real-time voice conversation
-		// Check if conversation mode is requested
-		conversationMode := false
-		if len(isConversationMode) > 0 {
-			conversationMode = isConversationMode[0]
-		}
-		return StreamingXiaozhiKG(esn, transcribedText, isKG, conversationMode)
 	case "together":
 		if vars.APIConfig.Knowledge.Model == "" {
 			vars.APIConfig.Knowledge.Model = "meta-llama/Llama-3-70b-chat-hf"
@@ -436,19 +442,25 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string, isKG bo
 		} else {
 			time.Sleep(time.Millisecond * 300)
 		}
-		robot.Conn.PlayAnimation(
-			ctx,
-			&vectorpb.PlayAnimationRequest{
-				Animation: &vectorpb.Animation{
-					Name: TTSGetinAnimation,
+		if robot != nil {
+			robot.Conn.PlayAnimation(
+				ctx,
+				&vectorpb.PlayAnimationRequest{
+					Animation: &vectorpb.Animation{
+						Name: TTSGetinAnimation,
+					},
+					Loops: 1,
 				},
-				Loops: 1,
-			},
-		)
+			)
+		}
 		if !vars.APIConfig.Knowledge.CommandsEnable {
 			go func() {
 				for {
 					if stopTTSLoop {
+						TTSLoopStopped <- true
+						break
+					}
+					if robot == nil {
 						TTSLoopStopped <- true
 						break
 					}
@@ -536,9 +548,17 @@ func KGSim(esn string, textToSay string) error {
 		var err error
 		robot, err = vector.New(vector.WithSerialNo(esn), vector.WithToken(guid), vector.WithTarget(target))
 		if err != nil {
-			return err
+			logger.Println(fmt.Sprintf("Warning: Failed to create robot connection for ESN %s: %v. Skipping robot control.", esn, err))
+			return nil // Return nil to allow TTS/STT to continue
 		}
 	}
+	
+	// If robot is not found, skip robot control but allow TTS/STT to continue
+	if robot == nil {
+		logger.Println(fmt.Sprintf("Robot %s not found in system, skipping robot control but allowing TTS/STT", esn))
+		return nil
+	}
+	
 	controlRequest := &vectorpb.BehaviorControlRequest{
 		RequestType: &vectorpb.BehaviorControlRequest_ControlRequest{
 			ControlRequest: &vectorpb.ControlRequest{
@@ -552,6 +572,10 @@ func KGSim(esn string, textToSay string) error {
 
 		go func() {
 			// * begin - modified from official vector-go-sdk
+			if robot == nil {
+				log.Println("Robot is nil, skipping BehaviorControl")
+				return
+			}
 			r, err := robot.Conn.BehaviorControl(
 				ctx,
 			)
@@ -602,6 +626,10 @@ func KGSim(esn string, textToSay string) error {
 		var stopTTSLoop bool
 		var TTSLoopStopped bool
 		for range start {
+			if robot == nil {
+				log.Println("Robot is nil, skipping PlayAnimation")
+				break
+			}
 			time.Sleep(time.Millisecond * 300)
 			robot.Conn.PlayAnimation(
 				ctx,
@@ -618,6 +646,10 @@ func KGSim(esn string, textToSay string) error {
 						TTSLoopStopped = true
 						break
 					}
+					if robot == nil {
+						TTSLoopStopped = true
+						break
+					}
 					robot.Conn.PlayAnimation(
 						ctx,
 						&vectorpb.PlayAnimationRequest{
@@ -631,6 +663,10 @@ func KGSim(esn string, textToSay string) error {
 			}()
 			textToSaySplit := strings.Split(textToSay, ". ")
 			for _, str := range textToSaySplit {
+				if robot == nil {
+					logger.Println("Robot is nil, skipping SayText")
+					break
+				}
 				_, err := robot.Conn.SayText(
 					ctx,
 					&vectorpb.SayTextRequest{
@@ -660,3 +696,4 @@ func KGSim(esn string, textToSay string) error {
 	}()
 	return nil
 }
+

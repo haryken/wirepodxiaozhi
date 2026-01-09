@@ -54,8 +54,10 @@ func LogTray(a ...any) {
 	for _, b := range LogTrayArray {
 		LogTrayList = LogTrayList + b
 	}
-	select {
-	case LogTrayChan <- time.Now().Format("2006.01.02 15:04:05") + ": " + fmt.Sprint(a...) + "\n":
-	default:
+	if LogTrayChan != nil {
+		select {
+		case LogTrayChan <- time.Now().Format("2006.01.02 15:04:05") + ": " + fmt.Sprint(a...) + "\n":
+		default:
+		}
 	}
 }

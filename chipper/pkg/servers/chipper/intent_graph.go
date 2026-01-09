@@ -1,6 +1,7 @@
 package server
 
 import (
+	"io"
 	"time"
 
 	pb "github.com/digital-dream-labs/api/go/chipperpb"
@@ -14,6 +15,11 @@ func (s *Server) StreamingIntentGraph(stream pb.ChipperGrpc_StreamingIntentGraph
 
 	req, err := stream.Recv()
 	if err != nil {
+		// EOF is normal when client closes the stream gracefully
+		if err == io.EOF {
+			logger.Println("Intent graph stream closed by client (EOF) - this is normal")
+			return nil
+		}
 		logger.Println("Intent graph stream error")
 		logger.Println(err)
 

@@ -81,16 +81,37 @@ func (w *XiaozhiConnWrapper) ConnectProxy() error {
 		baseUrl = w.baseURL
 	}
 
+	// Luôn ưu tiên MAC address từ config Knowledge Graph
+	deviceID := GetDeviceIDFromConfig()
+	
+	// Nếu không có trong config, mới lấy từ header
+	if deviceID == "" {
+		deviceID = w.originReq.Header.Get("Device-Id")
+	}
+
 	headers := http.Header{}
 	headers.Add("Authorization", w.originReq.Header.Get("Authorization"))
 	headers.Add("Protocol-Version", w.originReq.Header.Get("Protocol-Version"))
-	headers.Add("Device-Id", w.originReq.Header.Get("Device-Id"))
+	if deviceID != "" {
+		headers.Add("Device-Id", deviceID)
+	}
 	headers.Add("Client-Id", w.originReq.Header.Get("Client-Id"))
+
+	// Log thông tin khi kết nối đến server xiaozhi
+	if deviceID != "" {
+		// Import logger nếu cần
+		// logger.Printf("[Xiaozhi] Connecting to server with Device-Id: %s", deviceID)
+	}
+
 	proxyConn, resp, err := websocket.DefaultDialer.Dial(baseUrl, headers)
 	if err != nil {
+		// Log lỗi kết nối
+		// logger.Printf("[Xiaozhi] Failed to connect to server: %v, Device-Id: %s", err, deviceID)
 		return err
 	}
 	if resp.StatusCode != http.StatusSwitchingProtocols {
+		// Log lỗi status code
+		// logger.Printf("[Xiaozhi] Invalid response status: %d, Device-Id: %s", resp.StatusCode, deviceID)
 		return errors.New("invalid request")
 	}
 	w.proxyConn = proxyConn
@@ -129,18 +150,18 @@ func (w *XiaozhiConnWrapper) WriteLoop(ctx context.Context) {
 		if w.proxyConn == nil {
 			return
 		}
-		
+
 		// Use goroutine to make ReadMessage non-blocking with context
 		done := make(chan bool, 1)
 		var msgType int
 		var msg []byte
 		var merr error
-		
+
 		go func() {
 			msgType, msg, merr = w.proxyConn.ReadMessage()
 			done <- true
 		}()
-		
+
 		select {
 		case <-ctx.Done():
 			return
@@ -182,18 +203,18 @@ func (w *XiaozhiConnWrapper) ReadLoop(ctx context.Context) (err error) {
 		if w.conn == nil {
 			return nil
 		}
-		
+
 		// Use goroutine to make ReadMessage non-blocking with context
 		done := make(chan bool, 1)
 		var msgType int
 		var msg []byte
 		var merr error
-		
+
 		go func() {
 			msgType, msg, merr = w.conn.ReadMessage()
 			done <- true
 		}()
-		
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
