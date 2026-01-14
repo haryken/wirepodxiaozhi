@@ -216,240 +216,76 @@
         <h3 style="margin-top: 20px;">🔗 Xiaozhi Device Pairing</h3>
         <hr class="small-hr">
         <div>
-          <!-- Progress Steps UI -->
-          <div id="pairingStepsContainer" style="margin: 20px 0; padding: 20px; background-color: #f5f5f5; border-radius: 8px; border: 2px solid #e0e0e0;">
-            <h4 style="color: #333; margin-bottom: 20px;">📋 Quy trình Pairing (4 bước)</h4>
+          <!-- Pairing Section -->
+          <div id="pairingContainer" style="margin: 20px 0; padding: 20px; background-color: #f5f5f5; border-radius: 8px; border: 2px solid #e0e0e0;">
+            <h4 style="color: #333; margin-bottom: 20px;">📋 Tạo Pairing Code</h4>
             
-            <!-- Bước 1: Chọn MAC Address -->
-            <div id="step1" class="pairing-step" style="margin-bottom: 20px; padding: 15px; background-color: white; border-radius: 5px; border-left: 4px solid #e0e0e0;">
-              <div style="display: flex; align-items: center; margin-bottom: 10px;">
-                <div class="step-number" style="width: 30px; height: 30px; border-radius: 50%; background-color: #e0e0e0; color: #666; display: flex; align-items: center; justify-content: center; font-weight: bold; margin-right: 10px;">1</div>
-                <h5 style="margin: 0; color: #999;">Lấy và Chọn MAC Address</h5>
-                <span id="step1Status" class="step-status" style="margin-left: auto; padding: 5px 10px; border-radius: 15px; font-size: 12px; background-color: #e0e0e0; color: #666;">⏳ Đang chờ</span>
-              </div>
-              <div id="step1Content" style="margin-left: 40px;">
-                <button id="loadMACAddressBtn" onclick="loadMACAddressesToSelect()" 
-                        style="padding: 10px 20px; background-color: #4285f4; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; margin-bottom: 15px;">
-                  🔍 Lấy MAC Address
+            <!-- Device ID/MAC Address Input -->
+            <div style="margin-bottom: 20px; padding: 15px; background-color: white; border-radius: 5px; border-left: 4px solid #4285f4;">
+              <label for="deviceIdInput" style="display: block; margin-bottom: 10px; font-weight: bold; color: #333; font-size: 14px;">
+                Device-Id / MAC Address: <span style="color: #db4437;">*</span>
+              </label>
+              <div style="display: flex; gap: 10px; align-items: center;">
+                <input type="text" id="deviceIdInput" placeholder="Nhập Device-Id hoặc MAC address (ví dụ: 6c:24:08:9e:ca:ee)" 
+                       style="flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 5px; font-family: monospace; font-size: 14px;" />
+                <button onclick="loadLocalMACToInput()" 
+                        style="padding: 10px 15px; background-color: #4285f4; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; white-space: nowrap;">
+                  🔄 Lấy MAC tự động
                 </button>
-                <p style="font-size: 12px; color: #666; margin-bottom: 15px;">
-                  Nhấn nút "Lấy MAC Address" để tải danh sách MAC addresses có sẵn, sau đó chọn MAC address của máy bạn muốn pair.
-                </p>
-                <div id="macAddressSelectContainer" style="display: none;">
-                  <label for="macAddressSelect" style="display: block; margin-bottom: 8px; font-weight: bold; color: #333;">
-                    Chọn MAC Address:
-                  </label>
-                  <select id="macAddressSelect" style="padding: 8px; width: 100%; max-width: 500px; border: 1px solid #ddd; border-radius: 5px; font-family: monospace; font-size: 14px;" onchange="onMACAddressSelected()">
-                    <option value="">-- Chọn MAC Address --</option>
-                  </select>
-                  <p style="font-size: 12px; color: #666; margin-top: 8px; margin-bottom: 0;">
-                    MAC address đã chọn sẽ được dùng để generate pairing code.
-                  </p>
-                </div>
-                <div id="selectedMACInfo" style="margin-top: 10px; padding: 10px; background-color: #e8f5e9; border-radius: 5px; display: none;">
-                  <p style="margin: 0 0 8px 0; color: #2e7d32; font-size: 12px;">
-                    ✅ Đã chọn MAC Address: <code style="background: white; padding: 2px 6px; border-radius: 3px; font-family: monospace; font-weight: bold;">-</code>
-                  </p>
-                  <div id="selectedClientIdInfo" style="margin-top: 8px; padding: 8px; background-color: #e3f2fd; border-radius: 3px; display: none;">
-                    <p style="margin: 0; color: #1976d2; font-size: 11px;">
-                      🆔 Client-Id (UUID): <code style="background: white; padding: 2px 6px; border-radius: 3px; font-family: monospace; font-weight: bold; color: #1976d2;">-</code>
-                    </p>
-                  </div>
-                </div>
               </div>
-            </div>
-
-            <!-- Bước 2: Generate Pairing Code -->
-            <div id="step2" class="pairing-step" style="margin-bottom: 20px; padding: 15px; background-color: white; border-radius: 5px; border-left: 4px solid #e0e0e0;">
-              <div style="display: flex; align-items: center; margin-bottom: 10px;">
-                <div class="step-number" style="width: 30px; height: 30px; border-radius: 50%; background-color: #e0e0e0; color: #666; display: flex; align-items: center; justify-content: center; font-weight: bold; margin-right: 10px;">2</div>
-                <h5 style="margin: 0; color: #999;">Generate Pairing Code</h5>
-                <span id="step2Status" class="step-status" style="margin-left: auto; padding: 5px 10px; border-radius: 15px; font-size: 12px; background-color: #e0e0e0; color: #666;">⏳ Đang chờ</span>
-              </div>
-              <div id="step2Content" style="margin-left: 40px;">
-                <button id="generatePairingCodeBtn" onclick="generateXiaozhiPairingCode()" 
-                        style="padding: 10px 20px; background-color: #9e9e9e; color: white; border: none; border-radius: 5px; cursor: not-allowed; font-size: 16px;"
-                        disabled>
-                  🔑 Generate Pairing Code
-                </button>
-                <p style="font-size: 12px; color: #999; margin-top: 5px; margin-bottom: 0;">
-                  Vui lòng hoàn thành bước 1 trước.
-                </p>
-                <div id="pairingCodeDisplay" style="margin-top: 15px; padding: 20px; background-color: #e3f2fd; border-radius: 5px; display: none;">
-                  <h4 style="color: #1976d2; margin-bottom: 10px;">🎯 Mã Pairing của bạn:</h4>
-                  <div id="pairingCode" style="font-size: 48px; font-weight: bold; color: #1976d2; letter-spacing: 10px; margin: 20px 0; text-align: center; font-family: monospace;">
-                  </div>
-                  <div id="clientIdDisplay" style="margin-top: 20px; padding: 15px; background-color: #fff; border-radius: 5px; border: 2px solid #1976d2;">
-                    <p style="margin: 0 0 8px 0; color: #1976d2; font-weight: bold; font-size: 14px;">🆔 Client-Id (UUID):</p>
-                    <div id="clientIdValue" style="font-size: 16px; font-family: monospace; color: #1976d2; word-break: break-all; padding: 8px; background-color: #e3f2fd; border-radius: 3px;">
-                      Đang tải...
-                    </div>
-                    <p style="margin: 8px 0 0 0; color: #666; font-size: 11px;">
-                      💡 Client-Id được tự động tạo và lưu vào config (giống ESP32). Client-Id này sẽ được gửi kèm trong tất cả các request đến Xiaozhi server.
-                    </p>
-                  </div>
-                  <div id="pairingCodeInfo" style="margin-top: 10px; font-size: 12px; color: #666;"></div>
-                </div>
-              </div>
-            </div>
-
-            <!-- Bước 3: Nhập code vào ESP32 -->
-            <div id="step3" class="pairing-step" style="margin-bottom: 20px; padding: 15px; background-color: white; border-radius: 5px; border-left: 4px solid #e0e0e0;">
-              <div style="display: flex; align-items: center; margin-bottom: 10px;">
-                <div class="step-number" style="width: 30px; height: 30px; border-radius: 50%; background-color: #e0e0e0; color: #666; display: flex; align-items: center; justify-content: center; font-weight: bold; margin-right: 10px;">3</div>
-                <h5 style="margin: 0; color: #999;">Nhập code vào ESP32</h5>
-                <span id="step3Status" class="step-status" style="margin-left: auto; padding: 5px 10px; border-radius: 15px; font-size: 12px; background-color: #e0e0e0; color: #666;">⏳ Đang chờ</span>
-              </div>
-              <div id="step3Content" style="margin-left: 40px;">
-                <div style="padding: 15px; background-color: #fff3e0; border-radius: 5px; border: 1px solid #ffb74d;">
-                  <p style="margin: 0 0 10px 0; color: #e65100; font-weight: bold;">📱 Hướng dẫn:</p>
-                  <ol style="margin: 0; padding-left: 20px; color: #666; font-size: 14px; line-height: 1.8;">
-                    <li>Mở thiết bị ESP32 Xiaozhi của bạn (hoặc PC đang chạy code ESP32)</li>
-                    <li>Thiết bị sẽ tự động gọi <code style="background: #fff; padding: 2px 6px; border-radius: 3px;">/api/xiaozhi_check_version</code> và nhận activation code</li>
-                    <li>Mã 6 chữ số sẽ được hiển thị trên màn hình ESP32</li>
-                    <li>Nhập mã đó vào thiết bị (nếu ESP32 yêu cầu nhập thủ công)</li>
-                    <li>Thiết bị sẽ tự động kết nối với MAC address/Device-Id của nó</li>
-                  </ol>
-                  <p style="margin: 10px 0 0 0; color: #ff9800; font-size: 12px;">
-                    <strong>💡 Lưu ý:</strong> Nếu PC kết nối mà không có MAC address, hệ thống sẽ tự động tạo Device-Id từ IP address (bắt đầu bằng "pc_")
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            <!-- Bước 4: ESP32 tự động activate -->
-            <div id="step4" class="pairing-step" style="margin-bottom: 20px; padding: 15px; background-color: white; border-radius: 5px; border-left: 4px solid #e0e0e0;">
-              <div style="display: flex; align-items: center; margin-bottom: 10px;">
-                <div class="step-number" style="width: 30px; height: 30px; border-radius: 50%; background-color: #e0e0e0; color: #666; display: flex; align-items: center; justify-content: center; font-weight: bold; margin-right: 10px;">4</div>
-                <h5 style="margin: 0; color: #999;">ESP32 tự động activate</h5>
-                <span id="step4Status" class="step-status" style="margin-left: auto; padding: 5px 10px; border-radius: 15px; font-size: 12px; background-color: #e0e0e0; color: #666;">⏳ Đang chờ</span>
-              </div>
-              <div id="step4Content" style="margin-left: 40px;">
-                <div style="padding: 15px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #81c784;">
-                  <p style="margin: 0; color: #2e7d32; font-size: 14px;">
-                    ✅ Sau khi nhập code, ESP32 sẽ tự động:
-                  </p>
-                  <ul style="margin: 10px 0 0 0; padding-left: 20px; color: #666; font-size: 14px; line-height: 1.8;">
-                    <li>Tính HMAC-SHA256 của challenge</li>
-                    <li>Gửi activation request đến <code style="background: #fff; padding: 2px 6px; border-radius: 3px;">/api/xiaozhi_activate</code></li>
-                    <li>Nhận token và kết nối thành công</li>
-                  </ul>
-                </div>
-                <div id="activationStatus" style="margin-top: 15px; padding: 15px; background-color: #f5f5f5; border-radius: 5px; display: none;">
-                  <!-- Trạng thái activation sẽ được hiển thị ở đây -->
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div id="xiaozhiPairingStatus"></div>
-          
-          <!-- Section chọn MAC address -->
-          <div style="margin: 20px 0; padding: 15px; background-color: #f9f9f9; border-radius: 5px; border: 1px solid #ddd;">
-            <label for="macAddressSelect" style="display: block; margin-bottom: 10px; font-weight: bold; color: #333;">
-              📍 Bước 1: Chọn MAC Address
-            </label>
-            <select id="macAddressSelect" style="padding: 8px; width: 100%; max-width: 500px; border: 1px solid #ddd; border-radius: 5px; font-family: monospace; font-size: 14px;" onchange="onMACAddressSelected()">
-              <option value="">Đang tải MAC addresses...</option>
-            </select>
-            <p style="font-size: 12px; color: #666; margin-top: 8px;">
-              <strong>Lưu ý:</strong> Chọn MAC address của máy bạn muốn pair. MAC address đã chọn sẽ được dùng để generate pairing code.
-            </p>
-            <div id="selectedMACInfo" style="margin-top: 10px; padding: 10px; background-color: #e8f5e9; border-radius: 5px; display: none;">
-              <p style="margin: 0; color: #2e7d32; font-size: 12px;">
-                ✅ Đã chọn: <code style="background: white; padding: 2px 6px; border-radius: 3px; font-family: monospace; font-weight: bold;">-</code>
+              <p style="font-size: 12px; color: #666; margin-top: 8px; margin-bottom: 0;">
+                💡 Nhập Device-Id hoặc MAC address của thiết bị bạn muốn pair. Bạn có thể nhập thủ công hoặc click "Lấy MAC tự động" để tự động điền MAC address của máy đang chạy wirepod.
               </p>
             </div>
-          </div>
-          
-          <!-- Nút Generate Pairing Code -->
-          <div style="margin: 20px 0;">
-            <button id="generatePairingCodeBtn" onclick="generateXiaozhiPairingCode()" 
-                    style="padding: 10px 20px; background-color: #4285f4; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px;"
-                    disabled>
-              📍 Bước 2: Generate Pairing Code
-            </button>
-            <p style="font-size: 12px; color: #999; margin-top: 5px;">
-              Vui lòng chọn MAC address ở trên trước khi generate pairing code.
-            </p>
-          </div>
-          <div id="pairingStatusCheck" style="margin-top: 10px; padding: 10px; background-color: #f5f5f5; border-radius: 5px; display: none;">
-            <!-- Trạng thái pairing sẽ được hiển thị ở đây -->
-          </div>
-          <div id="pairingCodeDisplay" style="margin-top: 20px; display: none;">
-            <h4 style="color: #0f9d58;">Your Pairing Code:</h4>
-            <div id="pairingCode" style="font-size: 48px; font-weight: bold; color: #4285f4; letter-spacing: 10px; margin: 20px 0;">
-            </div>
-            <p style="color: #666; font-size: 14px;"><strong>Hướng dẫn:</strong></p>
-            <ol style="color: #666; font-size: 14px; margin-left: 20px; line-height: 1.8;">
-              <li>Nhập mã 6 chữ số này vào thiết bị ESP32 Xiaozhi của bạn (hoặc PC đang chạy code ESP32)</li>
-              <li>Thiết bị sẽ tự động kết nối với MAC address/Device-Id của nó</li>
-              <li>Nếu PC kết nối mà không có MAC address, hệ thống sẽ tự động tạo Device-Id từ IP address</li>
-              <li>Mã này sẽ hết hạn sau 10 phút</li>
-            </ol>
-            <p style="color: #ff9800; font-size: 12px; margin-top: 10px;">
-              <strong>Lưu ý:</strong> Nếu báo "thiết bị đã được thêm", có thể MAC address của thiết bị đã được lưu trong server xiaozhi từ lần pair trước. 
-              Hãy liên hệ admin server xiaozhi để xóa device hoặc kiểm tra log để xem MAC address.
-            </p>
-            <div id="pairingCodeInfo" style="margin-top: 10px; font-size: 12px; color: #999;"></div>
-          </div>
-          
-          <!-- Section hiển thị MAC address của máy đang chạy code -->
-          <div style="margin-top: 30px; padding: 20px; background-color: #fff3e0; border-radius: 5px; border: 2px solid #ff9800;">
-            <h4 style="color: #e65100; margin-bottom: 15px;">🖥️ MAC Address của máy đang chạy code</h4>
-            <p style="font-size: 12px; color: #666; margin-bottom: 15px;">
-              MAC address của máy tính đang chạy wirepodxiaozhi server (PC của bạn):
-            </p>
-            <button onclick="loadLocalMACAddress()" style="padding: 8px 15px; background-color: #ff9800; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; margin-bottom: 15px;">
-              🔄 Lấy MAC Address
-            </button>
-            <div id="localMACDisplay" style="margin-top: 10px; padding: 15px; background-color: white; border-radius: 5px; display: none;">
-              <!-- MAC address sẽ được hiển thị ở đây -->
-            </div>
-          </div>
 
-          <!-- Section kiểm tra trạng thái pairing -->
-          <div style="margin-top: 30px; padding: 20px; background-color: #e8f5e9; border-radius: 5px; border: 2px solid #4caf50;">
-            <h4 style="color: #2e7d32; margin-bottom: 15px;">✅ Kiểm tra trạng thái Pairing</h4>
-            <p style="font-size: 12px; color: #666; margin-bottom: 15px;">
-              Nhập Device-Id / MAC address và Client-Id (optional) để kiểm tra xem thiết bị đã được pair/activate hay chưa:
-            </p>
-            <div style="margin-bottom: 10px;">
-              <label for="checkDeviceIdInput" style="display: block; margin-bottom: 5px; font-weight: bold; color: #333; font-size: 13px;">
-                Device-Id / MAC Address:
+            <!-- Client-Id (UUID) Input -->
+            <div style="margin-bottom: 20px; padding: 15px; background-color: white; border-radius: 5px; border-left: 4px solid #9c27b0;">
+              <label for="clientIdInput" style="display: block; margin-bottom: 10px; font-weight: bold; color: #333; font-size: 14px;">
+                🆔 Client-Id (UUID): <span style="color: #db4437;">*</span>
               </label>
-              <input type="text" id="checkDeviceIdInput" placeholder="Nhập Device-Id hoặc MAC address (ví dụ: pc_192.168.1.100:54321 hoặc 6c:24:08:9e:ca:ee)" 
-                     style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 5px; font-family: monospace; font-size: 14px;" />
+              <div style="display: flex; gap: 10px; align-items: center;">
+                <input type="text" id="clientIdInput" placeholder="Nhập Client-Id (UUID) hoặc để trống để tự động tạo (ví dụ: 6681b470-b56e-4218-aff8-99189f85de0a)" 
+                       style="flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 5px; font-family: monospace; font-size: 14px;" />
+                <button onclick="generateUUIDToInput()" 
+                        style="padding: 10px 15px; background-color: #9c27b0; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; white-space: nowrap;">
+                  🎲 Tạo UUID
+                </button>
+              </div>
+              <p style="font-size: 12px; color: #666; margin-top: 8px; margin-bottom: 0;">
+                💡 Nhập Client-Id (UUID) của thiết bị. Nếu để trống, hệ thống sẽ tự động tạo UUID mới. Bạn có thể nhập thủ công hoặc click "Tạo UUID" để tự động generate.
+              </p>
             </div>
-            <div style="margin-bottom: 15px;">
-              <label for="checkClientIdInput" style="display: block; margin-bottom: 5px; font-weight: bold; color: #333; font-size: 13px;">
-                Client-Id (UUID) <span style="color: #666; font-weight: normal; font-size: 11px;">(Optional - để trống sẽ dùng Client-Id từ config)</span>:
-              </label>
-              <input type="text" id="checkClientIdInput" placeholder="Nhập Client-Id (UUID) hoặc để trống để dùng Client-Id từ config (ví dụ: e8c9b0b3-350f-406d-a31c-7b87be097881)" 
-                     style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 5px; font-family: monospace; font-size: 14px;" />
-            </div>
-            <div style="display: flex; gap: 10px; margin-bottom: 15px;">
-              <button onclick="checkDeviceStatus()" style="padding: 8px 20px; background-color: #4caf50; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; white-space: nowrap;">
-                🔍 Kiểm tra
+
+            <!-- Generate Button -->
+            <div style="margin-bottom: 20px;">
+              <button id="generatePairingCodeBtn" onclick="generatePairingCodeFromInput()" 
+                      style="padding: 12px 24px; background-color: #0f9d58; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; font-weight: bold;">
+                🔑 Tạo mã Pairing
               </button>
             </div>
-            <div id="deviceStatusResult" style="margin-top: 10px; padding: 15px; background-color: white; border-radius: 5px; display: none;">
-              <!-- Kết quả sẽ được hiển thị ở đây -->
-            </div>
-          </div>
 
-          <!-- Section hiển thị MAC addresses đã kết nối -->
-          <div style="margin-top: 30px; padding: 20px; background-color: #f5f5f5; border-radius: 5px;">
-            <h4 style="color: #4285f4; margin-bottom: 15px;">📱 Device-Id / MAC Addresses đã kết nối</h4>
-            <p style="font-size: 12px; color: #666; margin-bottom: 10px;">
-              Danh sách các thiết bị đã kết nối WebSocket (ESP32 hoặc PC đang chạy code ESP32):<br/>
-              <strong>Lưu ý:</strong> Nếu PC của bạn kết nối mà không có MAC address, hệ thống sẽ tự động tạo Device-Id từ IP address (bắt đầu bằng "pc_")
-            </p>
-            <button onclick="loadConnectedDevices()" style="padding: 8px 15px; background-color: #0f9d58; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; margin-bottom: 15px;">
-              🔄 Refresh danh sách
-            </button>
-            <div id="connectedDevicesList" style="margin-top: 10px;">
-              <p style="color: #999; font-style: italic;">Click "Refresh" để xem danh sách MAC addresses đã kết nối...</p>
+            <!-- Status Display -->
+            <div id="xiaozhiPairingStatus" style="margin-bottom: 15px; padding: 10px; border-radius: 5px; display: none;"></div>
+
+            <!-- Device Info Display (after generation) -->
+            <div id="deviceInfoDisplay" style="margin-bottom: 20px; padding: 15px; background-color: white; border-radius: 5px; border-left: 4px solid #4caf50; display: none;">
+              <h5 style="margin: 0 0 15px 0; color: #2e7d32;">✅ Thông tin thiết bị</h5>
+              <div style="margin-left: 10px;">
+                <p style="margin: 8px 0; color: #666; font-size: 14px;">
+                  <strong>Device-Id / MAC Address:</strong> <code id="displayDeviceId" style="background: #e8f5e9; padding: 4px 8px; border-radius: 3px; font-family: monospace; font-weight: bold; color: #2e7d32;">-</code>
+                </p>
+                <p style="margin: 8px 0; color: #666; font-size: 14px;">
+                  <strong>Client-Id (UUID):</strong> <code id="displayClientId" style="background: #e3f2fd; padding: 4px 8px; border-radius: 3px; font-family: monospace; font-weight: bold; color: #1976d2;">-</code>
+                </p>
+              </div>
+            </div>
+
+            <!-- Pairing Code Display -->
+            <div id="pairingCodeDisplay" style="margin-top: 15px; padding: 20px; background-color: #e3f2fd; border-radius: 5px; display: none;">
+              <h4 style="color: #1976d2; margin-bottom: 10px;">🎯 Mã Pairing của bạn:</h4>
+              <div id="pairingCode" style="font-size: 48px; font-weight: bold; color: #1976d2; letter-spacing: 10px; margin: 20px 0; text-align: center; font-family: monospace;">
+              </div>
+              <div id="pairingCodeInfo" style="margin-top: 10px; font-size: 12px; color: #666;"></div>
             </div>
           </div>
         </div>

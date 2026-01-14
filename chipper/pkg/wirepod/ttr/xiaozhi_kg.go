@@ -91,6 +91,14 @@ func (h *LLMHandler) HandleMessage(messageType int, message []byte) error {
 		case "tts":
 			if state, ok := event["state"].(string); ok {
 				logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] 🔊 TTS state: %s", state))
+				// Log TTS state even if audio playback is not available (for debugging)
+				h.mu.RLock()
+				vclientAvailable := h.vclient != nil
+				opusDecoderAvailable := h.opusDecoder != nil
+				h.mu.RUnlock()
+				if !vclientAvailable || !opusDecoderAvailable {
+					logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ⚠️  TTS state received but audio playback not available (vclient: %v, opusDecoder: %v) - will log audio frames but not play", vclientAvailable, opusDecoderAvailable))
+				}
 				if state == "start" {
 					// Reset counter when TTS starts
 					h.mu.Lock()
@@ -258,16 +266,18 @@ func (h *LLMHandler) HandleMessage(messageType int, message []byte) error {
 		h.mu.Unlock()
 
 		// Skip if vclient or opusDecoder is nil
-		// IMPORTANT: Log every frame if nil to debug race condition
+		// IMPORTANT: Log audio frames even if playback is not available (for debugging)
 		if vclient == nil || opusDecoder == nil {
-			// Log every frame if nil (especially frame #1) to debug race condition
-			logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] ⚠️  Skipping audio frame (vclient or opusDecoder is nil, frame #%d) - vclient: %v, opusDecoder: %v", count, vclient != nil, opusDecoder != nil))
+			// Log first few frames and then every 50th frame if nil (to avoid spam)
+			if count <= 3 || count%50 == 0 {
+				logger.Println(fmt.Sprintf("[Xiaozhi KG Handler] 🔊 Received audio frame #%d (size: %d bytes) but audio playback not available (vclient: %v, opusDecoder: %v) - frame will be logged but not played", count, len(message), vclient != nil, opusDecoder != nil))
+			}
 			// Try to get vclient and opusDecoder again (may have been set after handler registration)
 			h.mu.RLock()
 			vclient = h.vclient
 			opusDecoder = h.opusDecoder
 			h.mu.RUnlock()
-			// If still nil, return
+			// If still nil, return (but we've logged the frame for debugging)
 			if vclient == nil || opusDecoder == nil {
 				return nil
 			}
@@ -523,15 +533,27 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Robot %s not found in vars.BotInfo.Robots", esn, esn))
 	}
 
+	// Robot connection is optional - allow LLM/TTS to work even without robot
+	// This is important for Android builds where robot connection might fail with 401
 	var err error
-	robot, err = vector.New(vector.WithSerialNo(esn), vector.WithToken(guid), vector.WithTarget(target))
-	if err != nil {
-		return "", err
-	}
-
-	_, err = robot.Conn.BatteryState(ctx, &vectorpb.BatteryStateRequest{})
-	if err != nil {
-		return "", err
+	if matched {
+		robot, err = vector.New(vector.WithSerialNo(esn), vector.WithToken(guid), vector.WithTarget(target))
+		if err != nil {
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Failed to create robot connection: %v. Continuing without robot connection (LLM/TTS will still work).", esn, err))
+			robot = nil
+		} else {
+			// Test connection with BatteryState
+			_, err = robot.Conn.BatteryState(ctx, &vectorpb.BatteryStateRequest{})
+			if err != nil {
+				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Robot connection test failed: %v. Continuing without robot connection (LLM/TTS will still work).", esn, err))
+				robot = nil
+			} else {
+				logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Robot connection established successfully", esn))
+			}
+		}
+	} else {
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Robot not found, continuing without robot connection (LLM/TTS will still work)", esn))
+		robot = nil
 	}
 
 	// Lấy Device-Id từ config
@@ -710,13 +732,27 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 		audioQueueStarted:       false,
 	}
 
-	// IMPORTANT: Register LLM handler BEFORE sending text query
-	// This prevents "No active handler" errors when server sends llm/tts events immediately
+	// IMPORTANT: Register LLM handler AFTER connection is stored in manager
+	// This ensures connection exists in manager before registering handler
+	// CRITICAL: Activate handler immediately when registering to catch TTS messages
 	if deviceID != "" {
-		// Register handler early (before audio setup) to catch early messages
-		// Handler will be inactive initially, but will be activated after audio setup
+		// Connection is now guaranteed to be in manager (either from STT or newly created)
+		// Register handler AFTER connection is stored to ensure SetLLMHandler can find it
+		// CRITICAL: Activate handler immediately - don't wait for audio setup
+		// This ensures TTS messages are received even if audio setup fails
+		llmHandler.SetActive(true)
 		xiaozhi.SetLLMHandler(deviceID, llmHandler)
-		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ LLM handler registered EARLY (before text query) to catch server messages", esn))
+		// Double-check handler is active after registration
+		if llmHandler.IsActive() {
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ LLM handler registered and ACTIVATED (connection in manager, handler active)", esn))
+		} else {
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - LLM handler registered but NOT ACTIVE! This may cause TTS messages to be ignored!", esn))
+			// Force activate again
+			llmHandler.SetActive(true)
+			xiaozhi.SetLLMHandler(deviceID, llmHandler)
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ LLM handler force-activated again", esn))
+		}
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Handler is ACTIVE and ready to receive TTS messages from server", esn))
 	}
 
 	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ Text query sent successfully to server", esn))
@@ -733,10 +769,15 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 	logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Checking robot connection status: robot == nil? %v", esn, robot == nil))
 	if robot != nil {
 		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Creating audio playback client for robot...", esn))
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Robot connection details - Target: %s, ESN: %s, GUID: %s", esn, target, esn, guid))
 		// Use audioCtx instead of ctx to prevent stream from closing when LLM request completes
 		audioClient, err := robot.Conn.ExternalAudioStreamPlayback(audioCtx)
 		if err != nil {
-			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Failed to create audio playback client: %v. Continuing without audio playback.", esn, err))
+			// On Android, this often fails with 401 Unauthorized because Android cannot directly connect to robot
+			// This is expected behavior - robot connects to wirepod, not the other way around
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  WARNING - Failed to create audio playback client: %v", esn, err))
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  This is normal on Android - robot connects to wirepod, wirepod cannot connect back to robot", esn))
+			logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ⚠️  Continuing without audio playback. TTS messages will still be received and logged.", esn))
 			vclient = nil
 			audioPrepareSent = false
 		} else {
@@ -881,13 +922,16 @@ func StreamingXiaozhiKG(esn string, transcribedText string, isKG bool, isConvers
 	// Update LLM handler with audio setup AFTER audio is ready
 	// Handler was already registered early (before text query) to catch server messages
 	// Now we just need to update it with vclient and opusDecoder
+	// IMPORTANT: Always activate handler even if audio setup failed - TTS messages should still be logged
 	if deviceID != "" {
 		// Log audio setup status
 		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | Updating LLM handler with audio setup - vclient != nil: %v, audioPrepareSent: %v, opusDecoder != nil: %v",
 			esn, vclient != nil, audioPrepareSent, llmHandler.opusDecoder != nil))
 
-		// Ensure handler is active (it was registered early but may be inactive)
+		// CRITICAL: Always activate handler even if audio setup failed
+		// This ensures TTS messages from server are received and logged (even if not played)
 		llmHandler.SetActive(true)
+		logger.Println(fmt.Sprintf("[Xiaozhi KG] Device: %s | ✅ LLM handler activated (audio ready: %v, will log TTS even if audio playback unavailable)", esn, vclient != nil && audioPrepareSent))
 
 		// Re-register handler to ensure it's active and has latest state
 		xiaozhi.SetLLMHandler(deviceID, llmHandler)

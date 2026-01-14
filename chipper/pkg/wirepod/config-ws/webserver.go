@@ -606,20 +606,32 @@ func handleXiaozhiGeneratePairingCode(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Printf("[DEBUG] handleXiaozhiGeneratePairingCode: deviceID=%s (from query or auto-detected)\n", deviceID)
 
-	// Lấy hoặc tạo Client-Id (UUID) - giống ESP32 tự động generate nếu chưa có
-	clientID := xiaozhi.GetClientIDFromConfig()
+	// Lấy Client-Id từ query parameter (nếu có), nếu không thì lấy từ config hoặc tự động generate
+	clientID := r.URL.Query().Get("client_id")
 	if clientID == "" {
-		// Nếu Knowledge provider không phải xiaozhi, vẫn generate để hiển thị
-		clientID = xiaozhi.GenerateClientID()
-		fmt.Printf("[DEBUG] handleXiaozhiGeneratePairingCode: Generated new Client-Id=%s\n", clientID)
-		// Lưu vào config nếu chưa có
+		// Không có client_id trong query, lấy từ config hoặc generate mới
+		clientID = xiaozhi.GetClientIDFromConfig()
+		if clientID == "" {
+			// Nếu Knowledge provider không phải xiaozhi, vẫn generate để hiển thị
+			clientID = xiaozhi.GenerateClientID()
+			fmt.Printf("[DEBUG] handleXiaozhiGeneratePairingCode: Generated new Client-Id=%s (not from query)\n", clientID)
+			// Lưu vào config nếu chưa có
+			if vars.APIConfig.Knowledge.Provider == "xiaozhi" {
+				vars.APIConfig.Knowledge.ClientID = clientID
+				vars.WriteConfigToDisk()
+				fmt.Printf("[DEBUG] handleXiaozhiGeneratePairingCode: Saved Client-Id to config\n")
+			}
+		} else {
+			fmt.Printf("[DEBUG] handleXiaozhiGeneratePairingCode: Using existing Client-Id=%s from config\n", clientID)
+		}
+	} else {
+		fmt.Printf("[DEBUG] handleXiaozhiGeneratePairingCode: Using Client-Id=%s from query parameter\n", clientID)
+		// Nếu client_id được cung cấp từ query, lưu vào config nếu Knowledge provider là xiaozhi
 		if vars.APIConfig.Knowledge.Provider == "xiaozhi" {
 			vars.APIConfig.Knowledge.ClientID = clientID
 			vars.WriteConfigToDisk()
-			fmt.Printf("[DEBUG] handleXiaozhiGeneratePairingCode: Saved Client-Id to config\n")
+			fmt.Printf("[DEBUG] handleXiaozhiGeneratePairingCode: Saved Client-Id from query to config\n")
 		}
-	} else {
-		fmt.Printf("[DEBUG] handleXiaozhiGeneratePairingCode: Using existing Client-Id=%s from config\n", clientID)
 	}
 
 	// Generate pairing code với Client-Id (LOCAL - không gửi lên server)

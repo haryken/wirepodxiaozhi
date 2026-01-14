@@ -242,6 +242,137 @@ function updateWeatherAPI() {
     });
 }
 
+// Load local MAC address to input field
+function loadLocalMACToInput() {
+  const input = document.getElementById("deviceIdInput");
+  const statusDiv = document.getElementById("xiaozhiPairingStatus");
+  
+  if (!input) {
+    console.error("[Pairing] deviceIdInput not found");
+    return;
+  }
+  
+  if (statusDiv) {
+    statusDiv.innerHTML = "Đang lấy MAC address...";
+    statusDiv.style.color = "#666";
+    statusDiv.style.display = "block";
+  }
+  
+  fetch("/api/xiaozhi_get_local_mac")
+    .then(response => response.json())
+    .then(data => {
+      const macAddress = data.primary_mac || "";
+      if (macAddress) {
+        input.value = macAddress;
+        if (statusDiv) {
+          statusDiv.innerHTML = `✅ Đã tự động điền MAC address: <code style="background: #e8f5e9; padding: 2px 6px; border-radius: 3px; font-family: monospace;">${macAddress}</code>`;
+          statusDiv.style.color = "#0f9d58";
+        }
+        console.log("[Pairing] MAC address loaded:", macAddress);
+      } else {
+        if (statusDiv) {
+          statusDiv.innerHTML = "⚠️ Không tìm thấy MAC address. Vui lòng nhập thủ công.";
+          statusDiv.style.color = "#ff9800";
+        }
+        console.warn("[Pairing] Không tìm thấy MAC address");
+      }
+    })
+    .catch(error => {
+      console.error("[Pairing] Lỗi khi lấy MAC address:", error);
+      if (statusDiv) {
+        statusDiv.innerHTML = `❌ Lỗi khi lấy MAC address: ${error.message}. Vui lòng nhập thủ công.`;
+        statusDiv.style.color = "#db4437";
+      }
+    });
+}
+
+// Generate UUID and fill to input field
+function generateUUIDToInput() {
+  const input = document.getElementById("clientIdInput");
+  const statusDiv = document.getElementById("xiaozhiPairingStatus");
+  
+  if (!input) {
+    console.error("[Pairing] clientIdInput not found");
+    return;
+  }
+  
+  // Generate UUID v4
+  const uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+  
+  input.value = uuid;
+  
+  if (statusDiv) {
+    statusDiv.innerHTML = `✅ Đã tự động tạo UUID: <code style="background: #f3e5f5; padding: 2px 6px; border-radius: 3px; font-family: monospace;">${uuid}</code>`;
+    statusDiv.style.color = "#9c27b0";
+    statusDiv.style.display = "block";
+  }
+  
+  console.log("[Pairing] UUID generated:", uuid);
+}
+
+// Generate pairing code from input fields
+function generatePairingCodeFromInput() {
+  const deviceIdInput = document.getElementById("deviceIdInput");
+  const clientIdInput = document.getElementById("clientIdInput");
+  const statusDiv = document.getElementById("xiaozhiPairingStatus");
+  const generateBtn = document.getElementById("generatePairingCodeBtn");
+  
+  if (!deviceIdInput) {
+    console.error("[Pairing] deviceIdInput not found");
+    return;
+  }
+  
+  const deviceId = deviceIdInput.value.trim();
+  const clientId = clientIdInput ? clientIdInput.value.trim() : "";
+  
+  if (!deviceId) {
+    if (statusDiv) {
+      statusDiv.innerHTML = "❌ Vui lòng nhập Device-Id hoặc MAC Address, hoặc click 'Lấy MAC tự động' để tự động điền.";
+      statusDiv.style.color = "#db4437";
+      statusDiv.style.display = "block";
+    }
+    return;
+  }
+  
+  // Disable button while generating
+  if (generateBtn) {
+    generateBtn.disabled = true;
+    generateBtn.style.backgroundColor = "#9e9e9e";
+    generateBtn.style.cursor = "not-allowed";
+    generateBtn.textContent = "⏳ Đang tạo mã...";
+  }
+  
+  if (statusDiv) {
+    let statusText = `Đang tạo pairing code cho: <code style="background: #f5f5f5; padding: 2px 6px; border-radius: 3px; font-family: monospace;">${deviceId}</code>`;
+    if (clientId) {
+      statusText += ` với Client-Id: <code style="background: #f3e5f5; padding: 2px 6px; border-radius: 3px; font-family: monospace;">${clientId}</code>`;
+    } else {
+      statusText += ` (Client-Id sẽ được tự động tạo)`;
+    }
+    statusText += `...`;
+    statusDiv.innerHTML = statusText;
+    statusDiv.style.color = "#666";
+    statusDiv.style.display = "block";
+  }
+  
+  // Generate pairing code with both deviceId and clientId
+  generatePairingCodeWithMAC(deviceId, clientId);
+  
+  // Re-enable button after a delay (will be re-enabled when generation completes)
+  setTimeout(() => {
+    if (generateBtn) {
+      generateBtn.disabled = false;
+      generateBtn.style.backgroundColor = "#0f9d58";
+      generateBtn.style.cursor = "pointer";
+      generateBtn.textContent = "🔑 Tạo mã Pairing";
+    }
+  }, 2000);
+}
+
 function checkKG() {
   const provider = getE("kgProvider").value;
   const elements = [
@@ -1323,48 +1454,70 @@ function generateXiaozhiPairingCode() {
   generatePairingCodeWithMAC(selectedMACAddress);
 }
 
-function generatePairingCodeWithMAC(macAddress) {
+function generatePairingCodeWithMAC(deviceId, clientId = "") {
   const statusDiv = document.getElementById("xiaozhiPairingStatus");
   const codeDisplay = document.getElementById("pairingCodeDisplay");
   const codeDiv = document.getElementById("pairingCode");
   const infoDiv = document.getElementById("pairingCodeInfo");
+  const deviceInfoDisplay = document.getElementById("deviceInfoDisplay");
+  const displayDeviceId = document.getElementById("displayDeviceId");
+  const displayClientId = document.getElementById("displayClientId");
+  const generateBtn = document.getElementById("generatePairingCodeBtn");
   
-  // Cập nhật trạng thái bước 2: in-progress
-  updateStepStatus(2, 'in-progress', '🔄 Đang tạo pairing code...');
-  
-  statusDiv.innerHTML = `Đang tạo pairing code cho MAC address: <code style="background: #f5f5f5; padding: 2px 6px; border-radius: 3px; font-family: monospace;">${macAddress}</code>...`;
-  statusDiv.style.color = "#666";
-  
-  // Gửi MAC address đã chọn đến server để generate pairing code
-  const url = `/api/xiaozhi_generate_pairing_code?device_id=${encodeURIComponent(macAddress)}`;
+  // Gửi Device-Id và Client-Id đến server để generate pairing code
+  // Nếu clientId không được cung cấp, server sẽ tự động tạo UUID
+  let url = `/api/xiaozhi_generate_pairing_code?device_id=${encodeURIComponent(deviceId)}`;
+  if (clientId && clientId.trim() !== "") {
+    url += `&client_id=${encodeURIComponent(clientId.trim())}`;
+  }
   
   fetch(url, { method: "POST" })
     .then(response => response.json())
     .then(data => {
+      // Re-enable button
+      if (generateBtn) {
+        generateBtn.disabled = false;
+        generateBtn.style.backgroundColor = "#0f9d58";
+        generateBtn.style.cursor = "pointer";
+        generateBtn.textContent = "🔑 Tạo mã Pairing";
+      }
+      
       if (data.code) {
-        codeDiv.textContent = data.code;
-        codeDisplay.style.display = "block";
-        statusDiv.innerHTML = "✅ Pairing code đã được tạo thành công!";
-        statusDiv.style.color = "#0f9d58";
-        
-        // Hiển thị Client-Id trong UI
-        const clientIdDisplay = document.getElementById("clientIdValue");
-        if (clientIdDisplay && data.client_id) {
-          clientIdDisplay.textContent = data.client_id;
+        // Display pairing code
+        if (codeDiv) {
+          codeDiv.textContent = data.code;
+        }
+        if (codeDisplay) {
+          codeDisplay.style.display = "block";
+        }
+        if (statusDiv) {
+          statusDiv.innerHTML = "✅ Pairing code đã được tạo thành công!";
+          statusDiv.style.color = "#0f9d58";
         }
         
-        // Cập nhật trạng thái bước 2: completed, bước 3: in-progress
-        updateStepStatus(2, 'completed', '✅ Đã tạo pairing code');
-        updateStepStatus(3, 'in-progress', '⏳ Đang chờ nhập code vào ESP32');
-        updateStepStatus(4, 'pending', '⏳ Đang chờ ESP32 activate');
+        // Display device info
+        if (deviceInfoDisplay) {
+          deviceInfoDisplay.style.display = "block";
+        }
+        if (displayDeviceId && data.device_id) {
+          displayDeviceId.textContent = data.device_id;
+        }
+        if (displayClientId && data.client_id) {
+          displayClientId.textContent = data.client_id;
+        }
         
         // Bắt đầu kiểm tra activation status mỗi 3 giây
-        startActivationPolling(macAddress);
+        if (deviceId) {
+          startActivationPolling(deviceId);
+        }
         
-        // Hiển thị thông tin MAC address đã chọn và Client-Id
+        // Hiển thị thông tin Device-Id và Client-Id
         let infoText = "";
         if (data.device_id) {
-          infoText += `<strong>MAC Address đã chọn:</strong> <code style="background: #f5f5f5; padding: 2px 6px; border-radius: 3px; font-family: monospace;">${data.device_id}</code><br/>`;
+          infoText += `<strong>Device-Id / MAC Address:</strong> <code style="background: #f5f5f5; padding: 2px 6px; border-radius: 3px; font-family: monospace;">${data.device_id}</code><br/>`;
+        }
+        if (data.client_id) {
+          infoText += `<strong>Client-Id (UUID):</strong> <code style="background: #e3f2fd; padding: 2px 6px; border-radius: 3px; font-family: monospace; color: #1976d2;">${data.client_id}</code><br/>`;
         }
         if (data.note) {
           infoText += `<span style="color: #ff9800; font-size: 11px;">${data.note}</span><br/>`;
@@ -1373,7 +1526,9 @@ function generatePairingCodeWithMAC(macAddress) {
         // Update expiry info
         const expiresIn = data.expires_in || 600;
         infoText += `Mã sẽ hết hạn sau: ${Math.floor(expiresIn / 60)} phút ${expiresIn % 60} giây`;
-        infoDiv.innerHTML = infoText;
+        if (infoDiv) {
+          infoDiv.innerHTML = infoText;
+        }
         
         // Start countdown
         let remaining = expiresIn;
@@ -1384,30 +1539,46 @@ function generatePairingCodeWithMAC(macAddress) {
             const seconds = remaining % 60;
             let countdownText = "";
             if (data.device_id) {
-              countdownText += `<strong>MAC Address:</strong> <code style="background: #f5f5f5; padding: 2px 6px; border-radius: 3px; font-family: monospace;">${data.device_id}</code><br/>`;
+              countdownText += `<strong>Device-Id / MAC Address:</strong> <code style="background: #f5f5f5; padding: 2px 6px; border-radius: 3px; font-family: monospace;">${data.device_id}</code><br/>`;
             }
             if (data.client_id) {
               countdownText += `<strong>Client-Id (UUID):</strong> <code style="background: #e3f2fd; padding: 2px 6px; border-radius: 3px; font-family: monospace; color: #1976d2;">${data.client_id}</code><br/>`;
             }
             countdownText += `Mã sẽ hết hạn sau: ${minutes} phút ${seconds.toString().padStart(2, '0')} giây`;
-            infoDiv.innerHTML = countdownText;
+            if (infoDiv) {
+              infoDiv.innerHTML = countdownText;
+            }
           } else {
             clearInterval(countdownInterval);
-            codeDisplay.style.display = "none";
-            statusDiv.innerHTML = "Pairing code đã hết hạn. Vui lòng tạo mã mới.";
-            statusDiv.style.color = "#db4437";
+            if (codeDisplay) {
+              codeDisplay.style.display = "none";
+            }
+            if (statusDiv) {
+              statusDiv.innerHTML = "Pairing code đã hết hạn. Vui lòng tạo mã mới.";
+              statusDiv.style.color = "#db4437";
+            }
           }
         }, 1000);
       } else {
-        statusDiv.innerHTML = "Không thể tạo pairing code.";
-        statusDiv.style.color = "#db4437";
-        updateStepStatus(2, 'error', '❌ Lỗi tạo pairing code');
+        if (statusDiv) {
+          statusDiv.innerHTML = "❌ Không thể tạo pairing code. Vui lòng thử lại.";
+          statusDiv.style.color = "#db4437";
+        }
       }
     })
     .catch(error => {
-      statusDiv.innerHTML = `Lỗi: ${error.message}`;
-      statusDiv.style.color = "#db4437";
-      updateStepStatus(2, 'error', `❌ Lỗi: ${error.message}`);
+      // Re-enable button on error
+      if (generateBtn) {
+        generateBtn.disabled = false;
+        generateBtn.style.backgroundColor = "#0f9d58";
+        generateBtn.style.cursor = "pointer";
+        generateBtn.textContent = "🔑 Tạo mã Pairing";
+      }
+      
+      if (statusDiv) {
+        statusDiv.innerHTML = `❌ Lỗi: ${error.message}`;
+        statusDiv.style.color = "#db4437";
+      }
     });
 }
 
