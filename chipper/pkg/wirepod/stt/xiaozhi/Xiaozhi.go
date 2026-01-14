@@ -82,7 +82,11 @@ func (h *STTHandler) HandleMessage(messageType int, message []byte) error {
 					}()
 				} else {
 					// Empty transcript from server - send to channel immediately to avoid timeout
-					logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ⚠️  Received empty transcript from server (stt event with empty text)"))
+					// Empty transcript có thể xảy ra khi:
+					// 1. Audio không đủ rõ để transcribe
+					// 2. Server không nhận đủ audio data
+					// 3. Audio quá ngắn hoặc chỉ có noise
+					logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ⚠️  Received empty transcript from server (stt event with empty text) - server may not have received enough audio or audio was unclear"))
 					func() {
 						defer func() {
 							if r := recover(); r != nil {
@@ -91,7 +95,7 @@ func (h *STTHandler) HandleMessage(messageType int, message []byte) error {
 						}()
 						select {
 						case h.transcriptChan <- "":
-							logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ✅ Empty transcript sent to channel (server returned empty text)"))
+							logger.Println(fmt.Sprintf("Xiaozhi STT Handler: ✅ Empty transcript sent to channel (server returned empty text) - handler will remain active for potential TTS messages"))
 							h.mu.Lock()
 							h.transcriptReceived = true
 							h.mu.Unlock()
@@ -873,8 +877,13 @@ func STT(sreq sr.SpeechRequest) (string, error) {
 						decodedPCM := sreq.OpusDecode(chunk)
 						if len(decodedPCM) == 0 {
 							// Skip empty chunks (có thể do lỗi decode hoặc corrupt stream)
-							// Log để debug nhưng không spam
-							if chunkCount%50 == 0 || chunkCount == 1 {
+							// Chunk #1 thường là OGG header/metadata, không chứa audio - đây là bình thường
+							// Chỉ log warning nếu không phải chunk đầu tiên hoặc nếu có nhiều empty chunks liên tiếp
+							if chunkCount == 1 {
+								// Chunk #1 thường là OGG header - không cần log warning
+								logger.Println(fmt.Sprintf("Xiaozhi STT: ℹ️  Skipping chunk #1 (OGG header/metadata, %d bytes) - this is normal", len(chunk)))
+							} else if chunkCount%50 == 0 {
+								// Log mỗi 50 chunks để debug nếu có nhiều empty chunks
 								logger.Println(fmt.Sprintf("Xiaozhi STT: ⚠️  Skipping empty decoded chunk (chunk #%d, %d bytes) - may be corrupt OGG packet", chunkCount, len(chunk)))
 							}
 							continue
